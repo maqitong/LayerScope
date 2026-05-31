@@ -6,7 +6,7 @@ def _lookup_latency(table: Dict[int, float], token_count: int) -> float:
         return table[token_count]
     max_tc = max(table.keys())
     if token_count >= max_tc:
-        return table[max_tc]
+        return table[max_tc] * token_count / max_tc
     closest = min(table.keys(), key=lambda k: abs(k - token_count))
     return table[closest]
 
@@ -26,7 +26,8 @@ class ExpertLatencyModel:
         return _lookup_latency(self.latency_cpu_table, max(1, int(token_count)))
 
     def gpu_compute(self, token_count: int) -> float:
-        return _lookup_latency(self.latency_gpu_table, max(1, int(token_count)))
+        # return _lookup_latency(self.latency_gpu_table, max(1, int(token_count)))
+        return _lookup_latency(self.latency_gpu_table, 1) 
 
     def transfer(self, layer: int, expert_id: int) -> float:
         return self.t_io

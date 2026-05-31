@@ -209,7 +209,7 @@ def _lookup_latency(table: Dict[int, float], token_count: int) -> float:
 
     查找策略：
     - 精确匹配：直接返回
-    - 超出最大值：使用最大 token_count 的条目
+    - 超出最大值：基于最大 token_count 条目线性外推
     - 其他：使用最接近的 token_count 条目
 
     Args:
@@ -223,7 +223,7 @@ def _lookup_latency(table: Dict[int, float], token_count: int) -> float:
         return table[token_count]
     max_tc = max(table.keys())
     if token_count >= max_tc:
-        return table[max_tc]
+        return table[max_tc] * token_count / max_tc
     closest = min(table.keys(), key=lambda k: abs(k - token_count))
     return table[closest]
 
@@ -367,28 +367,30 @@ class PDScopeScheduler(ExpertScheduler):
         current_non_resident_ids = [d.key.expert_id for d in current_non_resident]
         future_ids = [d.key.expert_id for d in request.future]
         future_non_resident_ids = [d.key.expert_id for d in future_non_resident]
-        # print(
-        #     "[DecodeSchedule] "
-        #     f"layer={request.layer} k={k} t_cpu_1={t_c:.4f} t_gpu_1={t_g:.4f} "
-        #     f"t_io={latency.t_io:.4f} n_g_rho={n_g_rho} "
-        #     f"current={current_ids} current_resident={current_resident_ids} "
-        #     f"current_non_resident={current_non_resident_ids} "
-        #     f"future={future_ids} future_non_resident={future_non_resident_ids} "
-        #     f"next_resident_count={next_resident_count} "
-        #     f"free_placeholders={placement.free_placeholders} "
-        #     f"cur_below={cur_below} next_below={next_below}"
-        # )
+        if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+            print(
+                "[DecodeSchedule] "
+                f"layer={request.layer} k={k} t_cpu_1={t_c:.4f} t_gpu_1={t_g:.4f} "
+                f"t_io={latency.t_io:.4f} n_g_rho={n_g_rho} "
+                f"current={current_ids} current_resident={current_resident_ids} "
+                f"current_non_resident={current_non_resident_ids} "
+                f"future={future_ids} future_non_resident={future_non_resident_ids} "
+                f"next_resident_count={next_resident_count} "
+                f"cur_below={cur_below} next_below={next_below}"
+            )
 
         if cur_below and next_below:
         # 当前层和下一层驻留都不足，回退到 prefill 策略，尝试通过预加载来提升未来层驻留，从而间接提升当前层驻留
             schedule = self.schedule_prefill(request, placement, latency)
             schedule.reason = "decode-fallback-prefill"
-            # print(
-            #     "[DecodeSchedule] "
-            #     f"layer={request.layer} mode={schedule.reason} "
-            #     f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
-            #     f"preload={schedule.preload_expert_ids}"
-            # )
+            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+                print(
+                    "[DecodeSchedule] "
+                    f"layer={request.layer} mode={schedule.reason} "
+                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
+                    f"preload={schedule.preload_expert_ids}"
+                )
+
             return schedule
         if cur_below and not next_below:
         # 当前层驻留不足但下一层充足，优先补齐当前层 GPU 专家（mode-a），从全局候选中选取分数最高的 n_g_rho 个专家放入 GPU，剩余放 CPU
@@ -398,38 +400,41 @@ class PDScopeScheduler(ExpertScheduler):
             gpu = [d for d in current if (d.key.layer, d.key.expert_id) in gpu_keys]
             cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
             schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=[], evict=[], reason="decode-mode-a")
-            # print(
-            #     "[DecodeSchedule] "
-            #     f"layer={request.layer} mode={schedule.reason} need_current={need} "
-            #     f"ondemand={[d.key.expert_id for d in ondemand]} "
-            #     f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
-            # )
+            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+                print(
+                    "[DecodeSchedule] "
+                    f"layer={request.layer} mode={schedule.reason} need_current={need} "
+                    f"ondemand={[d.key.expert_id for d in ondemand]} "
+                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
+                )
             return schedule
         if not cur_below and next_below:
         # 当前层驻留充足但下一层不足，预加载下一层专家（mode-b）
-            need_next = max(0, min(n_g_rho - next_resident_count, placement.free_placeholders))
+            need_next = max(0, n_g_rho - next_resident_count)
             preload = future_non_resident[:need_next]
-            gpu = current_resident
+            gpu = current_resident[:n_g_rho] # 当前层 GPU 专家保持在理想数量 n_g_rho，剩余放 CPU
             gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
             cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
             schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=preload, evict=[], reason="decode-mode-b")
-            # print(
-            #     "[DecodeSchedule] "
-            #     f"layer={request.layer} mode={schedule.reason} need_next={need_next} "
-            #     f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
-            #     f"preload={schedule.preload_expert_ids}"
-            # )
+            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+                print(
+                    "[DecodeSchedule] "
+                    f"layer={request.layer} mode={schedule.reason} need_next={need_next} "
+                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
+                    f"preload={schedule.preload_expert_ids}"
+                )
             return schedule
 
         gpu = current_resident
         gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
         cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
         schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=[], evict=[], reason="decode-mode-c")
-        # print(
-        #     "[DecodeSchedule] "
-        #     f"layer={request.layer} mode={schedule.reason} "
-        #     f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
-        # )
+        if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+            print(
+                "[DecodeSchedule] "
+                f"layer={request.layer} mode={schedule.reason} "
+                f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
+            )
         return schedule
 
     def _select_global_queue(
@@ -500,8 +505,11 @@ class PDScopeScheduler(ExpertScheduler):
         2. capacity = min(空闲placeholder数, 气泡内可传输的专家数)
         3. 从未来预测专家中按 score 降序选取最多 capacity 个
         """
+        # Latency model values are milliseconds: benchmark tables store avg_time_ms
+        # and t_io is loaded from expert_weight_copy.avg_ms.
         t_gap = max(0.0, t_cpu - t_gpu)
-        capacity = min(placement.free_placeholders, math.floor((t_gap + self.t_attn) / max(latency.t_io, 1e-9)))
+        print(f"[PreloadSelect] t_gpu={t_gpu:.4f}ms t_cpu={t_cpu:.4f}ms")
+        capacity = math.floor((t_gap + self.t_attn) / max(latency.t_io, 1e-9))
         if capacity <= 0:
             return []
         xi = (2 * self.r_hit - 1) * latency.t_io
@@ -612,4 +620,3 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
         )
         schedule = self.scheduler.schedule(request, placement, self.latency_model)
         return schedule.cpu_expert_ids, schedule.gpu_expert_ids, schedule.preload_expert_ids, raw_assignments
-

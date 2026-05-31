@@ -30,8 +30,19 @@ def print_runtime_state(model, label):
         f"preload_request={executor.preload_request_count} "
         f"preload_success={executor.preload_success_count} "
         f"preload_skip={executor.preload_skip_count} "
-        f"preload_hit={executor.preload_hit_count}"
+        f"preload_hit={executor.preload_hit_count} "
+        f"eviction={model.placeholder_manager.eviction_count}"
     )
+
+
+def print_expert_timing(model):
+    lines = model.expert_executor.format_timing_summary()
+    if not lines:
+        print("[expert-timing] no expert executor timing recorded")
+        return
+    print("[expert-timing] wall_share uses layer execute wall time; shares can sum above 100% when tasks overlap")
+    for line in lines:
+        print(line)
 
 
 if __name__ == "__main__":
@@ -98,6 +109,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Print placeholder and preload counters around warmup and measurement.",
     )
+    parser.add_argument(
+        "--profile-expert-executor",
+        action="store_true",
+        help="Print per-layer GPU/CPU/preload timing. Adds CUDA synchronization overhead.",
+    )
     parser.add_argument("--beam-width", type=int, default=1, help="Beam search width.")
 
     args = parser.parse_args()
@@ -131,8 +147,12 @@ if __name__ == "__main__":
         output_token=args.output_token_num,
         input_token=args.input_token_num,
     )
+
+    # Print runtime state and expert executor timing if requested
     if args.debug_runtime_state:
         print_runtime_state(model, "after-measure")
+    if args.profile_expert_executor:
+        print_expert_timing(model)
     print(
         f"prefill_time: {prefill_time:.4f}, decode_time: {decode_time:.4f}, hit_rate: {hit_rate:.4f}"
     )

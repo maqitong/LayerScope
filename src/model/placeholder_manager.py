@@ -32,9 +32,11 @@ class ExpertPlaceholderManager:
         self._reverse_map: Dict[Tuple[int, int], int] = {}
         self._static_gpu_resident: set = set()
         self._loading: set = set()
+        self._protected: set = set()
         self._cpu_resident: set = set()
         self._ssd_resident: set = set()
         self._lock = threading.Lock()
+        self.eviction_count = 0
 
     @property
     def num_placeholders(self) -> int:
@@ -77,6 +79,18 @@ class ExpertPlaceholderManager:
                 return None
             self._assign(pid, layer_id, expert_id)
             return self._placeholders[pid]
+
+    def protect_expert(self, layer_id: int, expert_id: int):
+        with self._lock:
+            pid = self._reverse_map.get((layer_id, expert_id))
+            if pid is not None:
+                self._protected.add(pid)
+
+    def unprotect_expert(self, layer_id: int, expert_id: int):
+        with self._lock:
+            pid = self._reverse_map.get((layer_id, expert_id))
+            if pid is not None:
+                self._protected.discard(pid)
 
     def load_weights(self, placeholder: nn.Module, expert: nn.Module):
         with self._lock:
@@ -157,6 +171,11 @@ class ExpertPlaceholderManager:
             for pid in list(self._occupied.keys()):
                 self._release(pid)
             self._loading.clear()
+            self._protected.clear()
+
+    def reset_stats(self):
+        with self._lock:
+            self.eviction_count = 0
 
     def is_available(self, placeholder: nn.Module) -> bool:
         pid = self._placeholder_to_id(placeholder)
@@ -183,11 +202,12 @@ class ExpertPlaceholderManager:
         return None
 
     def _evict_one(self) -> Optional[int]:
-        occupied_ids = list(self._occupied.keys())
+        occupied_ids = [pid for pid in self._occupied.keys() if pid not in self._protected]
         if not occupied_ids:
             return None
         victim_id = self._eviction_strategy.select_victim(occupied_ids)
         if victim_id is not None:
+            self.eviction_count += 1
             self._release(victim_id)
         return victim_id
 

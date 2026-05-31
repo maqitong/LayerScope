@@ -50,11 +50,13 @@ class mDeepSeek:
 
         first_layer_mlp = self.model.layers[1].mlp
         template_expert = first_layer_mlp.experts[0]
+        # 初始化专家占位符管理器，预分配足够数量的占位符
         self.placeholder_manager = ExpertPlaceholderManager(
             template_expert=template_expert,
             device=self.dev,
-            num_placeholders= 2 * self.model.config.n_routed_experts,  # 每层非共享专家的两倍占位符数量
-            eviction_strategy=LRUEvictionStrategy(),
+            num_placeholders= 2 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
+            # eviction_strategy=LRUEvictionStrategy(),
+            eviction_strategy=None,
         )
         self.expert_placeholder = self.placeholder_manager._placeholders[0]
 
@@ -69,6 +71,7 @@ class mDeepSeek:
 
         self.cpu_offload = args.cpu_offload
         self.beam_width = args.beam_width
+        self.profile_expert_executor = getattr(args, "profile_expert_executor", False)
         self.n_layer = len(self.model.layers)
         self.n_expert = self.model.config.n_routed_experts
         self.n_shared_experts = 2
@@ -76,7 +79,7 @@ class mDeepSeek:
         ### 加载基准数据，设置专家调度策略的 CPU/GPU 延迟参数
         self.latency_cpu = 0.142
         self.latency_copy = 1.4
-        self.latency_gpu = 0.093
+        self.latency_gpu = 0.093 #ms
         self.latency_cpu_table = {1: 0.142}
         self.latency_gpu_table = {1: 0.093}
         benchmark_data = self._load_benchmark_data(args.model)
@@ -117,6 +120,7 @@ class mDeepSeek:
                 latency_io = self.latency_copy
             )
         self.gpu_only_strategy = GPUOnlyStrategy(self.dev, self.is_expert_in_gpu)
+        print(f"Initialized expert scheduling strategy: {self.expert_strategy.__class__.__name__}")
 
         # 初始化专家预测器和专家执行器
         self.expert_predictor = GatePredictor()
@@ -141,12 +145,15 @@ class mDeepSeek:
         )
         ## 计时——加载hot专家和executor
         load_model_tick = time.time()
+        self.cpu_experts = self.clone_cpu_experts()
         self.bring_expert_to_gpu()
         self.expert_executor = ExpertExecutionManager(
             device=self.dev,
             placeholder_manager=self.placeholder_manager,
             model=self.model,
             is_expert_in_gpu=self.is_expert_in_gpu,
+            profile_timing=self.profile_expert_executor,
+            cpu_experts=self.cpu_experts,
         )
         print("experts loaded to GPU, time:", time.time() - load_model_tick)
 
@@ -164,7 +171,6 @@ class mDeepSeek:
         except (json.JSONDecodeError, KeyError, OSError) as e:
             print(f"Warning: Failed to load benchmark file {filepath}: {e}")
             return None
-
 
 
     def bring_non_routed_expert_to_gpu(self):
@@ -205,13 +211,36 @@ class mDeepSeek:
             self.expert_loc[i_layer, i_expert] = 1
 
     def bring_expert_to_gpu(self):
-        for i in range(self.n_layer):
+        for i in range(1, self.n_layer):
             for j in range(self.n_expert):
                 if self.is_expert_in_gpu(i, j):
                     self.model.layers[i].mlp.experts[j].to(self.dev)
                     self.placeholder_manager.mark_static_gpu_resident(i, j)
                 else:
                     self.placeholder_manager.mark_cpu_resident(i, j)
+
+    def clone_cpu_experts(self):
+        cpu_experts = {}
+        pinned_count = 0
+        for i in range(1, self.n_layer):
+            for j in range(self.n_expert):
+                expert = copy.deepcopy(self.model.layers[i].mlp.experts[j]).to("cpu")
+                pinned_count += self.pin_module_tensors(expert)
+                cpu_experts[(i, j)] = expert
+        print(f"Pinned CPU expert source tensors: {pinned_count}")
+        return cpu_experts
+
+    def pin_module_tensors(self, module):
+        pinned_count = 0
+        for param in module.parameters():
+            if param.device.type == "cpu" and not param.is_pinned():
+                param.data = param.data.pin_memory()
+                pinned_count += 1
+        for buffer in module.buffers():
+            if buffer.device.type == "cpu" and not buffer.is_pinned():
+                buffer.data = buffer.data.pin_memory()
+                pinned_count += 1
+        return pinned_count
 
     def is_expert_in_gpu(self, i_layer, i_expert):
         return self.expert_loc[i_layer, i_expert] == 1 or self.placeholder_manager.is_on_gpu(i_layer, i_expert)
@@ -401,9 +430,11 @@ class mDeepSeek:
             self.expert_executor.preload_success_count = 0
             self.expert_executor.preload_skip_count = 0
             self.expert_executor.preload_hit_count = 0
+            self.expert_executor.reset_timing_stats()
 
         if clear_placeholders:
             self.placeholder_manager.clear_dynamic_placeholders()
+        self.placeholder_manager.reset_stats()
 
     def reset_hot_expert_stats(self):
         self.hot_expert_counts.clear()
