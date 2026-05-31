@@ -508,7 +508,7 @@ class PDScopeScheduler(ExpertScheduler):
         # Latency model values are milliseconds: benchmark tables store avg_time_ms
         # and t_io is loaded from expert_weight_copy.avg_ms.
         t_gap = max(0.0, t_cpu - t_gpu)
-        print(f"[PreloadSelect] t_gpu={t_gpu:.4f}ms t_cpu={t_cpu:.4f}ms")
+        # print(f"[PreloadSelect] t_gpu={t_gpu:.4f}ms t_cpu={t_cpu:.4f}ms")
         capacity = math.floor((t_gap + self.t_attn) / max(latency.t_io, 1e-9))
         if capacity <= 0:
             return []

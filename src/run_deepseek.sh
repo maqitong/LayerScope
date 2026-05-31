@@ -9,7 +9,8 @@ PYTHONPATH="$PWD" python ./scripts/infer_deepseek.py \
     --warmup 0 \
     --input-token-num 128 \
     --output-token-num 100 \
-    --debug-runtime-state\
-    --profile-expert-executor
+    --profile-torch 
+    # --debug-runtime-state \
+    # --profile-expert-executor \
     ## 开启后保留预热阶段的占位专家缓存
     #--preserve-warmup-cache \ 

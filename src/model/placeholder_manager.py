@@ -38,6 +38,9 @@ class ExpertPlaceholderManager:
         self._lock = threading.Lock()
         self.eviction_count = 0
 
+        self.static_gpu_resdient_hit_num = 0
+        self.placeholder_resident_hit_num = 0
+
     @property
     def num_placeholders(self) -> int:
         return len(self._placeholders)
@@ -134,6 +137,13 @@ class ExpertPlaceholderManager:
     def is_on_gpu(self, layer_id: int, expert_id: int) -> bool:
         with self._lock:
             key = (layer_id, expert_id)
+            # if key in self._reverse_map:
+            #     self.placeholder_resident_hit_num += 1
+            #     return True
+            # if key in self._static_gpu_resident:
+            #     self.static_gpu_resdient_hit_num += 1
+            #     return True
+            # return False
             return key in self._static_gpu_resident or key in self._reverse_map
 
     def is_static_gpu_resident(self, layer_id: int, expert_id: int) -> bool:

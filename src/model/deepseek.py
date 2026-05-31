@@ -23,7 +23,7 @@ from model.expert_scheduling import (
     _build_latency_lookup,
 )
 from model.placeholder_manager import ExpertPlaceholderManager
-from model.eviction_strategy import LRUEvictionStrategy
+from model.eviction_strategy import LRUEvictionStrategy, FIFOEvictionStrategy
 from model.expert_predictor import ExpertPredictor, GatePredictor
 from model.expert_executor import ExpertExecutionManager
 from model.expert_latency import ExpertLatencyModel
@@ -55,8 +55,8 @@ class mDeepSeek:
             template_expert=template_expert,
             device=self.dev,
             num_placeholders= 2 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
-            # eviction_strategy=LRUEvictionStrategy(),
-            eviction_strategy=None,
+            # eviction_strategy=FIFOEvictionStrategy(),
+            eviction_strategy=LRUEvictionStrategy(),
         )
         self.expert_placeholder = self.placeholder_manager._placeholders[0]
 
@@ -137,7 +137,6 @@ class mDeepSeek:
         print("shared expert and other modules loaded to GPU, time:", time.time() - load_model_tick)
 
         # 加载hot专家权重到 GPU 并初始化专家位置映射
-        self.expert_loc = np.zeros((self.n_layer, self.n_expert), dtype=int)
         n_expert_on_gpu = self.calc_n_expert_on_gpu()
         self.set_expert_loc(n_expert_on_gpu)
         print(
@@ -208,7 +207,7 @@ class mDeepSeek:
         n_expert_on_gpu = min(n_expert_on_gpu, len( popular_experts))
         for i in range(n_expert_on_gpu):
             i_layer, i_expert = popular_experts[i]
-            self.expert_loc[i_layer, i_expert] = 1
+            self.placeholder_manager.mark_static_gpu_resident(i_layer, i_expert)
 
     def bring_expert_to_gpu(self):
         for i in range(1, self.n_layer):
@@ -243,7 +242,7 @@ class mDeepSeek:
         return pinned_count
 
     def is_expert_in_gpu(self, i_layer, i_expert):
-        return self.expert_loc[i_layer, i_expert] == 1 or self.placeholder_manager.is_on_gpu(i_layer, i_expert)
+        return self.placeholder_manager.is_on_gpu(i_layer, i_expert)
 
     def calc_n_expert_on_gpu(self):
         fine_expert = self.model.layers[1].mlp.experts[0]
@@ -254,9 +253,9 @@ class mDeepSeek:
         print(f"Number of parameters in a single expert: {n_param}, memory: {expert_mem_mb:.2f} MB")
 
         total_mem = torch.cuda.get_device_properties(self.dev).total_memory
-        # 80% of total memory for safety margin
+        # 70% of total memory for safety margin
         #torch.cuda.memory_allocated：PyTorch 官方提供的显存统计 API，专门统计已使用的显存
-        free_mem = total_mem * 0.80 - torch.cuda.memory_allocated(self.dev) 
+        free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
         print(f"Total GPU memory: {total_mem / 1024 / 1024:.2f} MB, Free GPU memory: {free_mem / 1024 / 1024:.2f} MB")
         return int(free_mem // (n_param * 2))
 
@@ -298,7 +297,7 @@ class mDeepSeek:
         # 返回 2D attention_mask，让 mixtral_forward 中创建 causal mask
         return input_ids, position_ids, attention_mask
 
-    def generate(self, text=None, output_token=20, input_token=None):
+    def generate(self, text=None, output_token=20, input_token=None, profiler=None, profile_decode_steps=1):
         torch.set_num_threads(16)
         self.reset_runtime_state(clear_placeholders=False)
 
@@ -319,6 +318,10 @@ class mDeepSeek:
         probs = torch.full((input_ids.shape[0], 1), 1.0)
 
         for i_token in range(output_token):
+            if profiler is not None and i_token == 0:
+                profiler.start()
+                print("[profiler] profiling started (prefill)")
+
             if is_decode:
                 for i in range(input_ids.shape[0]):
                     decode_strings[i] += " " + self.tokenizer.decode(input_ids[i, :])
@@ -396,6 +399,11 @@ class mDeepSeek:
                 prefill_time += time.time() - tick
                 tick = time.time()
             is_decode = True
+
+            if profiler is not None and is_decode and i_token >= profile_decode_steps:
+                profiler.stop()
+                print(f"[profiler] profiling stopped after decode step {i_token}")
+                profiler = None
 
         if self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)

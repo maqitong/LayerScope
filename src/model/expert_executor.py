@@ -17,9 +17,12 @@ class ExpertExecutionManager:
         self.is_expert_in_gpu = is_expert_in_gpu
         self.profile_timing = profile_timing
         self.cpu_experts = cpu_experts if cpu_experts is not None else {}
+        self.compute_stream = torch.cuda.Stream(device=self.device) if self._is_cuda_device() else None
         self.preload_stream = torch.cuda.Stream(device=self.device) if self._is_cuda_device() else None
         self._timing_lock = threading.Lock()
         self._timing_stats = defaultdict(lambda: defaultdict(float))
+        self._preload_event_lock = threading.Lock()
+        self._preload_events = {}
         self.preload_request_count = 0
         self.preload_success_count = 0
         self.preload_skip_count = 0
@@ -29,10 +32,11 @@ class ExpertExecutionManager:
         gpu_result = None
         cpu_result = None
         wall_tick = time.perf_counter()
+        caller_stream = torch.cuda.current_stream(self.device) if self._is_cuda_device() else None
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {}
             if schedule.gpu_expert_ids:
-                futures[executor.submit(self._timed_call, context.layer, "gpu", self.execute_gpu_experts, context, schedule.gpu_expert_ids)] = "gpu"
+                futures[executor.submit(self._timed_call, context.layer, "gpu", self.execute_gpu_experts, context, schedule.gpu_expert_ids, caller_stream)] = "gpu"
             if schedule.cpu_expert_ids:
                 futures[executor.submit(self._timed_call, context.layer, "cpu", self.execute_cpu_experts, context, schedule.cpu_expert_ids)] = "cpu"
             if schedule.preload:
@@ -44,6 +48,8 @@ class ExpertExecutionManager:
             gpu_result = results.get("gpu")
             cpu_result = results.get("cpu")
 
+        if caller_stream is not None and gpu_result is not None:
+            caller_stream.wait_stream(self.compute_stream)
         result = torch.zeros_like(context.inps_flat, device=self.device)
         if gpu_result is not None:
             result += gpu_result
@@ -58,6 +64,8 @@ class ExpertExecutionManager:
     def reset_timing_stats(self) -> None:
         with self._timing_lock:
             self._timing_stats.clear()
+        with self._preload_event_lock:
+            self._preload_events.clear()
 
     def timing_summary(self) -> List[Dict[str, float]]:
         with self._timing_lock:
@@ -108,30 +116,44 @@ class ExpertExecutionManager:
         return lines
 
     def _timed_call(self, layer: int, name: str, fn, *args):
-        if not self.profile_timing:
-            return fn(*args)
         # if layer < 5:  # 仅打印前几层的调用信息以避免日志过多
-        print(
-            f"[timed-call] layer={layer} name={name} "
-            f"fn={getattr(fn, '__name__', repr(fn))} "
-            f"expert_ids={self._format_timed_call_expert_ids(name, args)}"
-        )
+        if self.profile_timing:
+            print(
+                f"[timed-call] layer={layer} name={name} "
+                f"fn={getattr(fn, '__name__', repr(fn))} "
+                f"expert_ids={self._format_timed_call_expert_ids(name, args)}"
+            )
 
-        if name in ("gpu", "preload") and self._is_cuda_device():
-            stream = self.preload_stream if name == "preload" else torch.cuda.current_stream(self.device)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+        if name == "gpu" and self._is_cuda_device():
+            stream = self.compute_stream
+            caller_stream = args[-1] if args else None
+            fn_args = args[:-1]
+            if caller_stream is not None:
+                stream.wait_stream(caller_stream)
+            start = torch.cuda.Event(enable_timing=True) if self.profile_timing else None
+            end = torch.cuda.Event(enable_timing=True) if self.profile_timing else None
             with torch.cuda.stream(stream):
-                start.record(stream)
-                result = fn(*args)
-                end.record(stream)
-            end.synchronize()
-            self._add_timing(layer, name, start.elapsed_time(end) / 1000.0)
+                if start is not None:
+                    start.record(stream)
+                result = fn(*fn_args)
+                if end is not None:
+                    end.record(stream)
+            if end is not None:
+                end.synchronize()
+                self._add_timing(layer, name, start.elapsed_time(end) / 1000.0)
+            return result
+
+        if name == "preload" and self._is_cuda_device():
+            tick = time.perf_counter()
+            result = fn(*args)
+            if self.profile_timing:
+                self._add_timing(layer, name, time.perf_counter() - tick)
             return result
 
         tick = time.perf_counter()
         result = fn(*args)
-        self._add_timing(layer, name, time.perf_counter() - tick)
+        if self.profile_timing:
+            self._add_timing(layer, name, time.perf_counter() - tick)
         return result
 
     def _add_timing(self, layer: int, name: str, elapsed: float) -> None:
@@ -165,15 +187,18 @@ class ExpertExecutionManager:
                 current_state = context.experts[expert_id](current_state)
             elif placeholder is not None:
                 self.preload_hit_count += 1
+                self._wait_for_preload(context.layer, expert_id)
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
                 try:
                     current_state = placeholder(current_state)
                 finally:
                     self.placeholder_manager.unprotect_expert(context.layer, expert_id)
+                self.placeholder_manager.release_by_layer(context.layer)
             else:
                 placeholder = self.placeholder_manager.acquire_placeholder(context.layer, expert_id)
                 if placeholder is None:
                     raise RuntimeError(f"No placeholder available for expert ({context.layer}, {expert_id})")
+                self._discard_preload_event(context.layer, expert_id)
                 self.placeholder_manager.load_weights(placeholder, self.get_cpu_expert(context.layer, expert_id))
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
                 try:
@@ -209,7 +234,6 @@ class ExpertExecutionManager:
         if self.preload_stream is not None:
             with torch.cuda.stream(self.preload_stream):
                 self._preload_experts_impl(demands)
-            self.preload_stream.synchronize()
             return
         self._preload_experts_impl(demands)
 
@@ -233,11 +257,12 @@ class ExpertExecutionManager:
                     continue
                 self.placeholder_manager.mark_loading(layer, expert_id)
                 try:
-                    placeholder = self.placeholder_manager.acquire_placeholder(layer, expert_id)
+                    placeholder = self.placeholder_manager.acquire_free_placeholder(layer, expert_id)
                     if placeholder is None:
                         self.preload_skip_count += 1
                         continue
                     self.placeholder_manager.load_weights(placeholder, self.get_cpu_expert(layer, expert_id))
+                    self._record_preload_event(layer, expert_id)
                     loaded += 1
                     self.preload_success_count += 1
                 finally:
@@ -246,3 +271,23 @@ class ExpertExecutionManager:
             # # replaced by func _add_timing to avoid excessive logging 
             # if loaded > 0:
             #     print(f"  Preload layer {layer}: {loaded} experts loaded in {elapsed*1000:.2f}ms")
+
+    def _record_preload_event(self, layer: int, expert_id: int) -> None:
+        if self.preload_stream is None:
+            return
+        event = torch.cuda.Event()
+        event.record(self.preload_stream)
+        with self._preload_event_lock:
+            self._preload_events[(layer, expert_id)] = event
+
+    def _wait_for_preload(self, layer: int, expert_id: int) -> None:
+        if self.compute_stream is None:
+            return
+        with self._preload_event_lock:
+            event = self._preload_events.pop((layer, expert_id), None)
+        if event is not None:
+            self.compute_stream.wait_event(event)
+
+    def _discard_preload_event(self, layer: int, expert_id: int) -> None:
+        with self._preload_event_lock:
+            self._preload_events.pop((layer, expert_id), None)

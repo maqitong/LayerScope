@@ -3,6 +3,9 @@ import json
 import os
 import random
 
+import torch.cuda.nvtx as nvtx
+from torch.profiler import profile, record_function, ProfilerActivity
+
 from model.deepseek import mDeepSeek
 
 
@@ -43,6 +46,11 @@ def print_expert_timing(model):
     print("[expert-timing] wall_share uses layer execute wall time; shares can sum above 100% when tasks overlap")
     for line in lines:
         print(line)
+
+def print_placeholder_hit_rate(model):
+    print(f"Placeholder resident hits: {model.placeholder_manager.placeholder_resident_hit_num}")
+    print(f"Static GPU resident hits: {model.placeholder_manager.static_gpu_resdient_hit_num}")
+
 
 
 if __name__ == "__main__":
@@ -115,6 +123,23 @@ if __name__ == "__main__":
         help="Print per-layer GPU/CPU/preload timing. Adds CUDA synchronization overhead.",
     )
     parser.add_argument("--beam-width", type=int, default=1, help="Beam search width.")
+    parser.add_argument(
+        "--profile-torch",
+        action="store_true",
+        help="Enable torch.profiler and export Chrome trace.",
+    )
+    parser.add_argument(
+        "--profile-torch-dir",
+        type=str,
+        default="./logs",
+        help="Directory to save torch.profiler output.",
+    )
+    parser.add_argument(
+        "--profile-decode-steps",
+        type=int,
+        default=1,
+        help="Number of decode steps to profile after prefill (default: 1).",
+    )
 
     args = parser.parse_args()
     model = mDeepSeek(args)
@@ -142,17 +167,41 @@ if __name__ == "__main__":
         if args.debug_runtime_state:
             print_runtime_state(model, "after-warmup-clean")
 
+    profiler_ctx = None
+    if args.profile_torch:
+        profiler_ctx = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+        )
+        print(f"[profiler] torch.profiler created, output dir: {args.profile_torch_dir}")
+
+    nvtx.range_push("inference")
     prefill_time, decode_time, hit_rate = model.generate(
         input_text,
         output_token=args.output_token_num,
         input_token=args.input_token_num,
+        profiler=profiler_ctx,
+        profile_decode_steps=args.profile_decode_steps if args.profile_torch else 0,
     )
+    nvtx.range_pop()
+
+    if profiler_ctx is not None:
+        os.makedirs(args.profile_torch_dir, exist_ok=True)
+        trace_path = os.path.join(args.profile_torch_dir, "trace.json")
+        profiler_ctx.export_chrome_trace(trace_path)
+        print(profiler_ctx.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+        print(f"[profiler] Chrome trace saved to: {trace_path}")
 
     # Print runtime state and expert executor timing if requested
     if args.debug_runtime_state:
         print_runtime_state(model, "after-measure")
     if args.profile_expert_executor:
         print_expert_timing(model)
+        print_placeholder_hit_rate(model)
+        
     print(
         f"prefill_time: {prefill_time:.4f}, decode_time: {decode_time:.4f}, hit_rate: {hit_rate:.4f}"
     )
