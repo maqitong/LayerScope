@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import os
 import random
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile-decode-steps",
         type=int,
-        default=1,
+        default=2,
         help="Number of decode steps to profile after prefill (default: 1).",
     )
 
@@ -190,7 +191,7 @@ if __name__ == "__main__":
 
     if profiler_ctx is not None:
         os.makedirs(args.profile_torch_dir, exist_ok=True)
-        trace_path = os.path.join(args.profile_torch_dir, "trace.json")
+        trace_path = os.path.join(args.profile_torch_dir, f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-trace.json")
         profiler_ctx.export_chrome_trace(trace_path)
         print(profiler_ctx.key_averages().table(sort_by="cuda_time_total", row_limit=30))
         print(f"[profiler] Chrome trace saved to: {trace_path}")

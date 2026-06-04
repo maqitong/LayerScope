@@ -33,6 +33,50 @@ def _build_expert_mask(selected_experts: torch.Tensor, n_expert: int) -> torch.T
     return torch.nn.functional.one_hot(selected_experts, num_classes=n_expert).permute(2, 1, 0)
 
 
+def _collect_expert_assignments(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    n_expert: int,
+) -> Tuple[List[int], Dict[int, torch.Tensor], Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
+    """直接从稀疏 top-k 路由结果构建活跃专家和 token 分配。
+
+    避免构造 [n_expert, top_k, n_token] 的 dense one-hot mask，也避免
+    _collect_active_experts 与 _organize_token_assignments 重复 torch.where。
+    """
+    flat_experts = selected_experts.reshape(-1)
+    top_k = selected_experts.shape[-1]
+    flat_weights = routing_weights.reshape(-1)
+
+    if flat_experts.numel() == 0:
+        return [], {}, {}
+
+    sorted_experts, order = torch.sort(flat_experts)
+    valid = (sorted_experts >= 0) & (sorted_experts < n_expert)
+    if not torch.all(valid):
+        sorted_experts = sorted_experts[valid]
+        order = order[valid]
+    if sorted_experts.numel() == 0:
+        return [], {}, {}
+
+    unique_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
+    token_positions = torch.div(order, top_k, rounding_mode="floor")
+    routing_weight_values = flat_weights.index_select(0, order).unsqueeze(-1)
+
+    active_experts = [int(expert_id) for expert_id in unique_experts.tolist()]
+    token_indices_by_expert = {}
+    expert_assignments = {}
+    start = 0
+    for i_expert, count_tensor in zip(active_experts, counts.tolist()):
+        end = start + int(count_tensor)
+        token_indices = token_positions[start:end]
+        routing_weight_subset = routing_weight_values[start:end]
+        token_indices_by_expert[i_expert] = token_indices
+        expert_assignments[i_expert] = (token_indices, routing_weight_subset)
+        start = end
+
+    return active_experts, token_indices_by_expert, expert_assignments
+
+
 def _collect_active_experts(expert_mask: torch.Tensor, n_expert: int) -> Tuple[List[int], Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
     """收集有 token 分配的活跃专家及其对应的 token 索引
     
@@ -120,9 +164,9 @@ class GPUOnlyStrategy(ExpertSchedulingStrategy):
         **kwargs,
     ) -> Tuple[List[int], List[int], Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
         """决策：所有活跃专家都在 GPU 上执行"""
-        expert_mask = _build_expert_mask(selected_experts, n_expert)
-        active_experts, _, _ = _collect_active_experts(expert_mask, n_expert)
-        expert_assignments = _organize_token_assignments(expert_mask, routing_weights, active_experts)
+        active_experts, _, expert_assignments = _collect_expert_assignments(
+            selected_experts, routing_weights, n_expert
+        )
         return [], active_experts, expert_assignments
 
 
@@ -165,14 +209,14 @@ class FiddlerStrategy(ExpertSchedulingStrategy):
             gpu_experts: 在 GPU 上执行的专家索引列表
             expert_assignments: 每个专家的 token 分配信息
         """
-        expert_mask = _build_expert_mask(selected_experts, n_expert)
-        active_experts, idxs, top_2s = _collect_active_experts(expert_mask, n_expert)
-        expert_assignments = _organize_token_assignments(expert_mask, routing_weights, active_experts)
+        active_experts, token_indices_by_expert, expert_assignments = _collect_expert_assignments(
+            selected_experts, routing_weights, n_expert
+        )
         
         cpu_experts = []
         gpu_experts = []
         for i_expert in active_experts:
-            token_count = top_2s[i_expert].shape[0]
+            token_count = token_indices_by_expert[i_expert].shape[0]
             cost_cpu = token_count * self.latency_cpu
             cost_gpu = self.latency_gpu + self.latency_io
             if self.is_expert_in_gpu(i_layer, i_expert):
@@ -578,9 +622,9 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
             preload_expert_ids: 预加载的专家 id 列表
             raw_assignments: 原始 (token_indices, routing_weights) 字典
         """
-        expert_mask = _build_expert_mask(selected_experts, n_expert)
-        active_experts, _, token_indices_by_expert = _collect_active_experts(expert_mask, n_expert)
-        raw_assignments = _organize_token_assignments(expert_mask, routing_weights, active_experts)
+        active_experts, token_indices_by_expert, raw_assignments = _collect_expert_assignments(
+            selected_experts, routing_weights, n_expert
+        )
         current_demands = build_current_demands(i_layer, active_experts, token_indices_by_expert)
         future = future_demands
         if future is None:
