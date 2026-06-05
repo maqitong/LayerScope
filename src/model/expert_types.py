@@ -135,30 +135,35 @@ def build_future_demands(
     if isinstance(predicted_experts, list):
         return predicted_experts
 
-    counts: Dict[int, int] = {}
-    scores: Dict[int, float] = {}
-    flat_experts = predicted_experts.reshape(-1, predicted_experts.shape[-1])
-    flat_weights = None
-    if predicted_weights is not None:
-        flat_weights = predicted_weights.reshape(-1, predicted_weights.shape[-1])
+    flat_experts = predicted_experts.reshape(-1)
+    if flat_experts.numel() == 0:
+        return []
 
-    for token_idx in range(flat_experts.shape[0]):
-        for slot_idx in range(flat_experts.shape[1]):
-            expert_id = int(flat_experts[token_idx, slot_idx].item())
-            counts[expert_id] = counts.get(expert_id, 0) + 1
-            if flat_weights is not None:
-                scores[expert_id] = scores.get(expert_id, 0.0) + float(flat_weights[token_idx, slot_idx].item())
-            else:
-                scores[expert_id] = scores.get(expert_id, 0.0) + 1.0
+    unique_experts, inverse, counts = torch.unique(
+        flat_experts,
+        sorted=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    if predicted_weights is not None:
+        flat_weights = predicted_weights.reshape(-1).to(device=flat_experts.device, dtype=torch.float32)
+        scores = torch.zeros(unique_experts.shape[0], dtype=torch.float32, device=flat_experts.device)
+        scores.index_add_(0, inverse, flat_weights)
+    else:
+        scores = counts.to(dtype=torch.float32)
+
+    unique_cpu = unique_experts.detach().cpu().tolist()
+    counts_cpu = counts.detach().cpu().tolist()
+    scores_cpu = scores.detach().cpu().tolist()
 
     return [
         ExpertDemand(
             key=ExpertKey(layer=layer, expert_id=expert_id),
-            token_count=counts[expert_id],
-            score=scores[expert_id],
+            token_count=int(token_count),
+            score=float(score),
             source=source,
         )
-        for expert_id in counts
+        for expert_id, token_count, score in zip(unique_cpu, counts_cpu, scores_cpu)
     ]
 
 

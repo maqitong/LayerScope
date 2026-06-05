@@ -1,6 +1,8 @@
 import os
 import sys
 
+import torch
+
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 MODEL_DIR = os.path.join(ROOT, "src", "model")
@@ -9,8 +11,25 @@ if MODEL_DIR not in sys.path:
 
 from expert_latency import ExpertLatencyModel
 from expert_scheduling import PDScopeScheduler
-from expert_types import ExpertDemand, ExpertKey, ExpertLayerRequest, PlacementSnapshot
+from expert_types import ExpertDemand, ExpertKey, ExpertLayerRequest, PlacementSnapshot, build_future_demands
 from placeholder_manager import ExpertPlaceholderManager
+
+
+def test_build_future_demands_aggregates_tensor_weights():
+    predicted_experts = torch.tensor([[[2, 1], [2, 3]]])
+    predicted_weights = torch.tensor([[[0.25, 0.5], [0.75, 0.125]]])
+
+    demands = build_future_demands(4, predicted_experts, predicted_weights)
+
+    by_expert = {d.key.expert_id: d for d in demands}
+    assert set(by_expert) == {1, 2, 3}
+    assert by_expert[1].token_count == 1
+    assert by_expert[1].score == 0.5
+    assert by_expert[2].token_count == 2
+    assert by_expert[2].score == 1.0
+    assert by_expert[3].token_count == 1
+    assert by_expert[3].score == 0.125
+    assert all(d.key.layer == 4 and d.source == "predicted" for d in demands)
 
 
 def test_scheduler_returns_disjoint_current_experts():
