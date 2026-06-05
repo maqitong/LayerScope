@@ -123,6 +123,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Print per-layer GPU/CPU/preload timing. Adds CUDA synchronization overhead.",
     )
+    parser.add_argument(
+        "--sync-timing",
+        action="store_true",
+        help="Synchronize CUDA around measured prefill/decode timing sections.",
+    )
+    parser.add_argument(
+        "--record-hot-experts",
+        action="store_true",
+        help="Record MoE expert selections for offline hot expert analysis.",
+    )
     parser.add_argument("--beam-width", type=int, default=1, help="Beam search width.")
     parser.add_argument(
         "--profile-torch",
@@ -140,6 +150,17 @@ if __name__ == "__main__":
         type=int,
         default=2,
         help="Number of decode steps to profile after prefill (default: 1).",
+    )
+    parser.add_argument(
+        "--record-expert-schedule",
+        action="store_true",
+        help="Record per-layer scheduling decisions (CPU/GPU/preload experts, strategy, placement, latency).",
+    )
+    parser.add_argument(
+        "--expert-schedule-log",
+        type=str,
+        default=None,
+        help="Path to write scheduling decision JSONL. If omitted, records are kept in memory only.",
     )
 
     args = parser.parse_args()
@@ -209,3 +230,18 @@ if __name__ == "__main__":
     if args.input_token_num is not None:
         print("tokens per second (prefill):", args.input_token_num / prefill_time)
     print("tokens per second (decode):", args.output_token_num / decode_time)
+
+    if args.record_expert_schedule and hasattr(model, "schedule_stats_recorder") and model.schedule_stats_recorder is not None:
+        summary = model.schedule_stats_recorder.summary()
+        print(f"[schedule-stats] Total scheduling calls: {summary['total_calls']}")
+        for row in summary.get("by_layer", []):
+            print(
+                f"[schedule-stats] strategy={row['strategy']} phase={row['phase']} "
+                f"layer={row['layer']} calls={row['calls']} reasons={row['reasons']} "
+                f"gpu_total={row['gpu_total']} cpu_total={row['cpu_total']} "
+                f"preload_total={row['preload_total']}"
+            )
+        if not args.expert_schedule_log:
+            print(f"[schedule-stats] Records kept in memory ({len(model.schedule_stats_recorder.records)} records). "
+                  "Use --expert-schedule-log PATH to write JSONL.")
+        model.schedule_stats_recorder.close()
