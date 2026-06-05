@@ -17,6 +17,7 @@ from transformers.masking_utils import create_causal_mask
 
 from model.expert_scheduling import (
     ExpertSchedulingStrategy,
+    ExpertSchedulingStatsRecorder,
     GPUOnlyStrategy,
     FiddlerStrategy,
     PrefetchHybridStrategy,
@@ -72,13 +73,15 @@ class mDeepSeek:
         self.cpu_offload = args.cpu_offload
         self.beam_width = args.beam_width
         self.profile_expert_executor = getattr(args, "profile_expert_executor", False)
+        self.sync_timing = getattr(args, "sync_timing", False)
+        self.record_hot_experts = getattr(args, "record_hot_experts", False)
         self.n_layer = len(self.model.layers)
         self.n_expert = self.model.config.n_routed_experts
         self.n_shared_experts = 2
 
         ### 加载基准数据，设置专家调度策略的 CPU/GPU 延迟参数
         self.latency_cpu = 0.142
-        self.latency_copy = 1.4
+        self.latency_copy = 0.86
         self.latency_gpu = 0.093 #ms
         self.latency_cpu_table = {1: 0.142}
         self.latency_gpu_table = {1: 0.093}
@@ -121,6 +124,8 @@ class mDeepSeek:
             )
         self.gpu_only_strategy = GPUOnlyStrategy(self.dev, self.is_expert_in_gpu)
         print(f"Initialized expert scheduling strategy: {self.expert_strategy.__class__.__name__}")
+
+        self._init_schedule_stats_recorder(args)
 
         # 初始化专家预测器和专家执行器
         self.expert_predictor = GatePredictor()
@@ -170,6 +175,39 @@ class mDeepSeek:
         except (json.JSONDecodeError, KeyError, OSError) as e:
             print(f"Warning: Failed to load benchmark file {filepath}: {e}")
             return None
+
+    def _init_schedule_stats_recorder(self, args):
+        record_schedule = getattr(args, "record_expert_schedule", False)
+        schedule_log = getattr(args, "expert_schedule_log", None)
+        self.schedule_stats_recorder: Optional[ExpertSchedulingStatsRecorder] = None
+        if not record_schedule:
+            return
+        runtime_meta = {
+            "cpu_offload": args.cpu_offload,
+            "model": getattr(args, "model", ""),
+            "batch_size": args.batch_size,
+            "beam_width": args.beam_width,
+            "n_layer": self.n_layer,
+            "n_expert": self.n_expert,
+            "n_shared_experts": self.n_shared_experts,
+            "num_placeholders": self.placeholder_manager.num_placeholders,
+            "eviction_strategy": type(self.placeholder_manager._eviction_strategy).__name__ if self.placeholder_manager._eviction_strategy else None,
+            "latency_cpu": self.latency_cpu,
+            "latency_gpu": self.latency_gpu,
+            "latency_copy": self.latency_copy,
+            "latency_cpu_table": {str(k): v for k, v in self.latency_cpu_table.items()},
+            "latency_gpu_table": {str(k): v for k, v in self.latency_gpu_table.items()},
+            "strategy": self.expert_strategy.__class__.__name__,
+        }
+        self.schedule_stats_recorder = ExpertSchedulingStatsRecorder(
+            output_path=schedule_log,
+            runtime_meta=runtime_meta,
+        )
+        self.expert_strategy.set_stats_recorder(self.schedule_stats_recorder)
+        if schedule_log:
+            print(f"[schedule-stats] Recording scheduling decisions to: {schedule_log}")
+        else:
+            print("[schedule-stats] Recording scheduling decisions (in-memory only)")
 
 
     def bring_non_routed_expert_to_gpu(self):
@@ -308,14 +346,15 @@ class mDeepSeek:
 
         input_ids, position_ids, attention_mask = self.tokenize(text, input_token)
 
-        if self.dev.type == "cuda":
+        if self.sync_timing and self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
         tick = time.time()
         is_decode = False
         prefill_time, decode_time = 0, 0
-        decode_strings = ["" for _ in range(input_ids.shape[0])]
+        original_batch_size = input_ids.shape[0]
+        generated_token_chunks = []
         search_start = False
-        probs = torch.full((input_ids.shape[0], 1), 1.0)
+        probs = torch.full((input_ids.shape[0],), 1.0, device=self.dev)
 
         for i_token in range(output_token):
             if profiler is not None and i_token == 0:
@@ -323,9 +362,6 @@ class mDeepSeek:
                 print("[profiler] profiling started (prefill)")
 
             if is_decode:
-                for i in range(input_ids.shape[0]):
-                    decode_strings[i] += " " + self.tokenizer.decode(input_ids[i, :])
-
                 # Decode 阶段：更新 attention_mask
                 # 此时 input_ids 是 [batch, 1]，表示生成一个新 token
                 # attention_mask 需要更新为 [batch, past_key_values_length + 1]
@@ -355,7 +391,6 @@ class mDeepSeek:
 
             logits = self.mixtral_forward(input_ids, new_position_ids, attention_mask, cache_position, is_prefill=not is_decode)
 
-            logits = logits.to("cpu")
             logits = F.softmax(logits, dim=-1)
 
             self.past_key_values_length += logits.shape[1]
@@ -363,7 +398,8 @@ class mDeepSeek:
             if search_start:
                 new_probs, output = torch.topk(logits, 1, dim=-1)
                 new_probs = new_probs[:, -1].flatten()  # [batch]
-                probs = probs * new_probs.repeat_interleave(self.beam_width)  # 广播到 [batch*beam_width]
+                output = output[:, -1].flatten()
+                probs = probs * new_probs
                 # print(new_probs.shape)
             else:
                 new_probs, output = torch.topk(logits, self.beam_width, dim=-1)
@@ -373,12 +409,14 @@ class mDeepSeek:
                 # print(new_probs.shape, output.shape)
                 search_start = True
 
+            generated_token_chunks.append(output.view(-1, 1))
+
             if search_start:
                 # Decode阶段：input_ids需要保持单个候选的第一个元素
-                input_ids = output.view(-1, 1).to(self.dev)
+                input_ids = output.view(-1, 1)
             else:
                 # Prefill阶段：选择第一个 beam 作为起始
-                input_ids = output.view(-1, self.beam_width)[:, 0].to(self.dev)
+                input_ids = output.view(-1, self.beam_width)[:, 0]
 
 
             position_ids = (
@@ -393,7 +431,7 @@ class mDeepSeek:
             )
 
             if not is_decode:
-                if self.dev.type == "cuda":
+                if self.sync_timing and self.dev.type == "cuda":
                     print("Prefill阶段完成,等待GPU同步...")
                     torch.cuda.synchronize(self.dev)
                 prefill_time += time.time() - tick
@@ -405,15 +443,22 @@ class mDeepSeek:
                 print(f"[profiler] profiling stopped after decode step {i_token}")
                 profiler = None
 
-        if self.dev.type == "cuda":
+        if self.sync_timing and self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
         decode_time = time.time() - tick
         probs = probs.view(-1, self.beam_width)
         max_ids = torch.argmax(probs, dim=-1)
+        decoded_outputs = [""] * original_batch_size
+        if generated_token_chunks:
+            generated_token_ids = torch.cat(generated_token_chunks, dim=1)
+            selected_tokens = generated_token_ids.view(original_batch_size, self.beam_width, -1)[
+                torch.arange(original_batch_size, device=self.dev), max_ids
+            ]
+            decoded_outputs = self.tokenizer.batch_decode(selected_tokens.detach().cpu(), skip_special_tokens=False)
 
         print("--------------------")
         print(f"Input: {text}")
-        print(f"Output: {decode_strings[max_ids[0]]}")
+        print(f"Output: {decoded_outputs[0]}")
 
         return (
             prefill_time,
@@ -443,6 +488,9 @@ class mDeepSeek:
         if clear_placeholders:
             self.placeholder_manager.clear_dynamic_placeholders()
         self.placeholder_manager.reset_stats()
+
+        if hasattr(self, "schedule_stats_recorder") and self.schedule_stats_recorder is not None:
+            self.schedule_stats_recorder.reset()
 
     def reset_hot_expert_stats(self):
         self.hot_expert_counts.clear()
@@ -551,8 +599,8 @@ class mDeepSeek:
             inps = inps.view(batch_size, seq_len, hidden_dim)
 
             selected_experts, routing_weights = layer.mlp.gate(inps)
-            # 记录专家选择统计
-            self.record_hot_expert_selection(i_layer, selected_experts)
+            if self.record_hot_experts:
+                self.record_hot_expert_selection(i_layer, selected_experts)
 
             # 与当前层专家执行并行：预测下一层活跃专家
             predict_future = None

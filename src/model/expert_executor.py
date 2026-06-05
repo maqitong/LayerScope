@@ -186,7 +186,6 @@ class ExpertExecutionManager:
             if self.placeholder_manager.is_static_gpu_resident(context.layer, expert_id):
                 current_state = context.experts[expert_id](current_state)
             elif placeholder is not None:
-                self.preload_hit_count += 1
                 self._wait_for_preload(context.layer, expert_id)
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
                 try:

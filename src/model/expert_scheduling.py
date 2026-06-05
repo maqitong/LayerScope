@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Optional
+import json
 import math
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,6 +20,137 @@ from model.expert_types import (
     build_future_demands,
     unique_demands,
 )
+
+
+def _demand_to_dict(d: ExpertDemand) -> Dict:
+    return {
+        "layer": d.key.layer,
+        "expert_id": d.key.expert_id,
+        "token_count": d.token_count,
+        "score": round(d.score, 6),
+        "source": d.source,
+    }
+
+
+def _placement_summary(placement: Optional[PlacementSnapshot], current_demands: Optional[List[ExpertDemand]] = None, future_demands: Optional[List[ExpertDemand]] = None) -> Dict:
+    if placement is None:
+        return {}
+    current_layer = current_demands[0].key.layer if current_demands else -1
+    future_layer = future_demands[0].key.layer if future_demands else current_layer + 1
+    current_resident = [d.key.expert_id for d in (current_demands or [])
+                        if placement.is_on_gpu(d.key.layer, d.key.expert_id)]
+    future_resident = [d.key.expert_id for d in (future_demands or [])
+                       if placement.is_on_gpu(d.key.layer, d.key.expert_id)]
+    return {
+        "gpu_resident_count": len(placement.gpu_resident),
+        "placeholder_resident_count": len(placement.placeholder_resident),
+        "loading_count": len(placement.loading),
+        "cpu_resident_count": len(placement.cpu_resident),
+        "ssd_resident_count": len(placement.ssd_resident),
+        "free_placeholders": placement.free_placeholders,
+        "current_resident": sorted(current_resident),
+        "future_resident": sorted(future_resident),
+    }
+
+
+def _latency_summary(latency_model: Optional[ExpertLatencyModel]) -> Dict:
+    if latency_model is None:
+        return {}
+    return {
+        "t_io": latency_model.t_io,
+        "latency_cpu_table": {str(k): v for k, v in latency_model.latency_cpu_table.items()},
+        "latency_gpu_table": {str(k): v for k, v in latency_model.latency_gpu_table.items()},
+    }
+
+
+def _token_counts_by_expert(token_indices_by_expert: Dict[int, torch.Tensor]) -> Dict[int, int]:
+    return {eid: int(t.shape[0]) for eid, t in token_indices_by_expert.items()}
+
+
+class ExpertSchedulingStatsRecorder:
+    """Opt-in recorder that collects structured scheduling decision records.
+
+    Each call to ``record()`` appends one JSON-serialisable dict to an
+    internal list.  If *output_path* is provided the record is also appended
+    as a single JSON line to that file (JSONL format).
+    """
+
+    def __init__(self, output_path: Optional[str] = None, runtime_meta: Optional[Dict] = None):
+        self.enabled = True
+        self.output_path = output_path
+        self.runtime_meta: Dict = runtime_meta or {}
+        self._records: List[Dict] = []
+        self._call_index = 0
+        self._file_handle = None
+        if self.output_path is not None:
+            import os
+            os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
+            self._file_handle = open(self.output_path, "a", encoding="utf-8")
+
+    def record(self, record: Dict) -> None:
+        if not self.enabled:
+            return
+        record["call_index"] = self._call_index
+        record["timestamp"] = time.time()
+        if self.runtime_meta:
+            record["runtime"] = self.runtime_meta
+        self._call_index += 1
+        self._records.append(record)
+        if self._file_handle is not None:
+            self._file_handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            self._file_handle.flush()
+
+    @property
+    def records(self) -> List[Dict]:
+        return list(self._records)
+
+    def reset(self) -> None:
+        self._records.clear()
+        self._call_index = 0
+
+    def close(self) -> None:
+        if self._file_handle is not None:
+            self._file_handle.close()
+            self._file_handle = None
+
+    def summary(self) -> Dict:
+        if not self._records:
+            return {"total_calls": 0}
+        by_key: Dict[Tuple, Dict] = {}
+        for rec in self._records:
+            key = (rec.get("strategy", ""), rec.get("phase", ""), rec.get("layer", -1))
+            bucket = by_key.setdefault(key, {"count": 0, "reasons": {}, "gpu_total": 0, "cpu_total": 0, "preload_total": 0, "unique_gpu": set(), "unique_cpu": set(), "unique_preload": set()})
+            bucket["count"] += 1
+            reason = rec.get("reason", "")
+            bucket["reasons"][reason] = bucket["reasons"].get(reason, 0) + 1
+            bucket["gpu_total"] += len(rec.get("gpu_experts", []))
+            bucket["cpu_total"] += len(rec.get("cpu_experts", []))
+            bucket["preload_total"] += len(rec.get("preload_experts", []))
+            for e in rec.get("gpu_experts", []):
+                eid = e.get("expert_id", e) if isinstance(e, dict) else e
+                bucket["unique_gpu"].add(eid)
+            for e in rec.get("cpu_experts", []):
+                eid = e.get("expert_id", e) if isinstance(e, dict) else e
+                bucket["unique_cpu"].add(eid)
+            for e in rec.get("preload_experts", []):
+                eid = e.get("expert_id", e) if isinstance(e, dict) else e
+                bucket["unique_preload"].add(eid)
+        rows = []
+        for (strategy, phase, layer), bucket in sorted(by_key.items()):
+            rows.append({
+                "strategy": strategy,
+                "phase": phase,
+                "layer": layer,
+                "calls": bucket["count"],
+                "reasons": bucket["reasons"],
+                "gpu_total": bucket["gpu_total"],
+                "cpu_total": bucket["cpu_total"],
+                "preload_total": bucket["preload_total"],
+                "unique_gpu": sorted(bucket["unique_gpu"]),
+                "unique_cpu": sorted(bucket["unique_cpu"]),
+                "unique_preload": sorted(bucket["unique_preload"]),
+            })
+        return {"total_calls": len(self._records), "by_layer": rows}
 
 
 def _build_expert_mask(selected_experts: torch.Tensor, n_expert: int) -> torch.Tensor:
@@ -51,10 +184,6 @@ def _collect_expert_assignments(
         return [], {}, {}
 
     sorted_experts, order = torch.sort(flat_experts)
-    valid = (sorted_experts >= 0) & (sorted_experts < n_expert)
-    if not torch.all(valid):
-        sorted_experts = sorted_experts[valid]
-        order = order[valid]
     if sorted_experts.numel() == 0:
         return [], {}, {}
 
@@ -62,12 +191,14 @@ def _collect_expert_assignments(
     token_positions = torch.div(order, top_k, rounding_mode="floor")
     routing_weight_values = flat_weights.index_select(0, order).unsqueeze(-1)
 
-    active_experts = [int(expert_id) for expert_id in unique_experts.tolist()]
+    unique_cpu = unique_experts.detach().cpu().tolist()
+    counts_cpu = counts.detach().cpu().tolist()
+    active_experts = [int(expert_id) for expert_id in unique_cpu]
     token_indices_by_expert = {}
     expert_assignments = {}
     start = 0
-    for i_expert, count_tensor in zip(active_experts, counts.tolist()):
-        end = start + int(count_tensor)
+    for i_expert, count in zip(active_experts, counts_cpu):
+        end = start + int(count)
         token_indices = token_positions[start:end]
         routing_weight_subset = routing_weight_values[start:end]
         token_indices_by_expert[i_expert] = token_indices
@@ -125,6 +256,10 @@ class ExpertSchedulingStrategy:
     def __init__(self, dev, is_expert_in_gpu):
         self.dev = dev
         self.is_expert_in_gpu = is_expert_in_gpu
+        self.stats_recorder: Optional[ExpertSchedulingStatsRecorder] = None
+
+    def set_stats_recorder(self, recorder: Optional[ExpertSchedulingStatsRecorder]):
+        self.stats_recorder = recorder
 
     def decide_and_prepare(
         self,
@@ -164,9 +299,26 @@ class GPUOnlyStrategy(ExpertSchedulingStrategy):
         **kwargs,
     ) -> Tuple[List[int], List[int], Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
         """决策：所有活跃专家都在 GPU 上执行"""
-        active_experts, _, expert_assignments = _collect_expert_assignments(
+        active_experts, token_indices_by_expert, expert_assignments = _collect_expert_assignments(
             selected_experts, routing_weights, n_expert
         )
+        if self.stats_recorder is not None:
+            current_demands = build_current_demands(i_layer, active_experts, token_indices_by_expert)
+            self.stats_recorder.record({
+                "strategy": self.__class__.__name__,
+                "reason": "gpu-only",
+                "layer": i_layer,
+                "phase": kwargs.get("is_prefill", True) and "prefill" or "decode",
+                "n_expert": n_expert,
+                "seq_len": selected_experts.shape[1] if selected_experts.dim() >= 2 else 1,
+                "top_k": selected_experts.shape[-1] if selected_experts.dim() >= 1 else 0,
+                "active_experts": active_experts,
+                "cpu_experts": [],
+                "gpu_experts": active_experts,
+                "preload_experts": [],
+                "token_counts": _token_counts_by_expert(token_indices_by_expert),
+                "placement": _placement_summary(kwargs.get("placement"), current_demands),
+            })
         return [], active_experts, expert_assignments
 
 
@@ -195,39 +347,65 @@ class FiddlerStrategy(ExpertSchedulingStrategy):
         n_expert: int,
         **kwargs,
     ) -> Tuple[List[int], List[int], Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
-        """决策：逐专家选择代价最小的 CPU/GPU 分配方案
-        
-        Args:
-            i_layer: 当前层索引
-            experts: 专家模块列表
-            selected_experts: 每个 token 选择的 top-2 专家
-            routing_weights: 每个 token 对所选专家的路由权重
-            n_expert: 总专家数
-        
-        Returns:
-            cpu_experts: 在 CPU 上执行的专家索引列表
-            gpu_experts: 在 GPU 上执行的专家索引列表
-            expert_assignments: 每个专家的 token 分配信息
-        """
+        """决策：逐专家选择代价最小的 CPU/GPU 分配方案"""
         active_experts, token_indices_by_expert, expert_assignments = _collect_expert_assignments(
             selected_experts, routing_weights, n_expert
         )
         
         cpu_experts = []
         gpu_experts = []
+        per_expert_details = []
         for i_expert in active_experts:
             token_count = token_indices_by_expert[i_expert].shape[0]
             cost_cpu = token_count * self.latency_cpu
             cost_gpu = self.latency_gpu + self.latency_io
-            if self.is_expert_in_gpu(i_layer, i_expert):
+            resident = self.is_expert_in_gpu(i_layer, i_expert)
+            if resident:
                 cost_gpu = 0
                 self.cnt_expert_hit += token_count
             self.cnt_expert_all += token_count
 
             if cost_cpu < cost_gpu:
                 cpu_experts.append(i_expert)
+                decision = "cpu"
             else:
                 gpu_experts.append(i_expert)
+                decision = "gpu"
+            per_expert_details.append({
+                "expert_id": i_expert,
+                "token_count": token_count,
+                "resident": resident,
+                "cost_cpu": round(cost_cpu, 6),
+                "cost_gpu": round(cost_gpu, 6),
+                "decision": decision,
+            })
+
+        if self.stats_recorder is not None:
+            self.stats_recorder.record({
+                "strategy": self.__class__.__name__,
+                "reason": "fiddler-cost-opt",
+                "layer": i_layer,
+                "phase": kwargs.get("is_prefill", True) and "prefill" or "decode",
+                "n_expert": n_expert,
+                "seq_len": selected_experts.shape[1] if selected_experts.dim() >= 2 else 1,
+                "top_k": selected_experts.shape[-1] if selected_experts.dim() >= 1 else 0,
+                "active_experts": active_experts,
+                "cpu_experts": cpu_experts,
+                "gpu_experts": gpu_experts,
+                "preload_experts": [],
+                "token_counts": _token_counts_by_expert(token_indices_by_expert),
+                "placement": _placement_summary(kwargs.get("placement")),
+                "strategy_params": {
+                    "latency_cpu": self.latency_cpu,
+                    "latency_gpu": self.latency_gpu,
+                    "latency_io": self.latency_io,
+                },
+                "per_expert_details": per_expert_details,
+                "counters": {
+                    "expert_hit": self.cnt_expert_hit,
+                    "expert_all": self.cnt_expert_all,
+                },
+            })
         
         return cpu_experts, gpu_experts, expert_assignments
 
@@ -403,37 +581,37 @@ class PDScopeScheduler(ExpertScheduler):
             if placement.is_on_gpu(d.key.layer, d.key.expert_id)
         )
 
-        cur_below = len(current_resident) < n_g_rho # 当前层驻留专家数不足以满足理想 GPU 专家数
-        next_below = next_resident_count < n_g_rho # 下一层驻留专家数不足以满足理想 GPU 专家数
+        cur_below = len(current_resident) <= n_g_rho # 当前层驻留专家数不足以满足理想 GPU 专家数
+        next_below = next_resident_count <= n_g_rho # 下一层驻留专家数不足以满足理想 GPU 专家数
 
         current_ids = [d.key.expert_id for d in current]
         current_resident_ids = [d.key.expert_id for d in current_resident]
         current_non_resident_ids = [d.key.expert_id for d in current_non_resident]
         future_ids = [d.key.expert_id for d in request.future]
         future_non_resident_ids = [d.key.expert_id for d in future_non_resident]
-        if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
-            print(
-                "[DecodeSchedule] "
-                f"layer={request.layer} k={k} t_cpu_1={t_c:.4f} t_gpu_1={t_g:.4f} "
-                f"t_io={latency.t_io:.4f} n_g_rho={n_g_rho} "
-                f"current={current_ids} current_resident={current_resident_ids} "
-                f"current_non_resident={current_non_resident_ids} "
-                f"future={future_ids} future_non_resident={future_non_resident_ids} "
-                f"next_resident_count={next_resident_count} "
-                f"cur_below={cur_below} next_below={next_below}"
-            )
+        # if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+        #     print(
+        #         "[DecodeSchedule] "
+        #         f"layer={request.layer} k={k} t_cpu_1={t_c:.4f} t_gpu_1={t_g:.4f} "
+        #         f"t_io={latency.t_io:.4f} n_g_rho={n_g_rho} "
+        #         f"current={current_ids} current_resident={current_resident_ids} "
+        #         f"current_non_resident={current_non_resident_ids} "
+        #         f"future={future_ids} future_non_resident={future_non_resident_ids} "
+        #         f"next_resident_count={next_resident_count} "
+        #         f"cur_below={cur_below} next_below={next_below}"
+        #     )
 
         if cur_below and next_below:
         # 当前层和下一层驻留都不足，回退到 prefill 策略，尝试通过预加载来提升未来层驻留，从而间接提升当前层驻留
             schedule = self.schedule_prefill(request, placement, latency)
             schedule.reason = "decode-fallback-prefill"
-            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
-                print(
-                    "[DecodeSchedule] "
-                    f"layer={request.layer} mode={schedule.reason} "
-                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
-                    f"preload={schedule.preload_expert_ids}"
-                )
+            # if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+            #     print(
+            #         "[DecodeSchedule] "
+            #         f"layer={request.layer} mode={schedule.reason} "
+            #         f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
+            #         f"preload={schedule.preload_expert_ids}"
+            #     )
 
             return schedule
         if cur_below and not next_below:
@@ -444,13 +622,13 @@ class PDScopeScheduler(ExpertScheduler):
             gpu = [d for d in current if (d.key.layer, d.key.expert_id) in gpu_keys]
             cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
             schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=[], evict=[], reason="decode-mode-a")
-            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
-                print(
-                    "[DecodeSchedule] "
-                    f"layer={request.layer} mode={schedule.reason} need_current={need} "
-                    f"ondemand={[d.key.expert_id for d in ondemand]} "
-                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
-                )
+            # if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+            #     print(
+            #         "[DecodeSchedule] "
+            #         f"layer={request.layer} mode={schedule.reason} need_current={need} "
+            #         f"ondemand={[d.key.expert_id for d in ondemand]} "
+            #         f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
+            #     )
             return schedule
         if not cur_below and next_below:
         # 当前层驻留充足但下一层不足，预加载下一层专家（mode-b）
@@ -460,25 +638,25 @@ class PDScopeScheduler(ExpertScheduler):
             gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
             cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
             schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=preload, evict=[], reason="decode-mode-b")
-            if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
-                print(
-                    "[DecodeSchedule] "
-                    f"layer={request.layer} mode={schedule.reason} need_next={need_next} "
-                    f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
-                    f"preload={schedule.preload_expert_ids}"
-                )
+            # if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+            #     print(
+            #         "[DecodeSchedule] "
+            #         f"layer={request.layer} mode={schedule.reason} need_next={need_next} "
+            #         f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} "
+            #         f"preload={schedule.preload_expert_ids}"
+            #     )
             return schedule
 
-        gpu = current_resident
+        gpu = current_resident[:n_g_rho]
         gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
         cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
         schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=[], evict=[], reason="decode-mode-c")
-        if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
-            print(
-                "[DecodeSchedule] "
-                f"layer={request.layer} mode={schedule.reason} "
-                f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
-            )
+        # if request.layer < 5:  # 仅打印前几层的调度决策以避免日志过多
+        #     print(
+        #         "[DecodeSchedule] "
+        #         f"layer={request.layer} mode={schedule.reason} "
+        #         f"gpu={schedule.gpu_expert_ids} cpu={schedule.cpu_expert_ids} preload=[]"
+        #     )
         return schedule
 
     def _select_global_queue(
@@ -606,22 +784,7 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
         future_demands: Optional[List[ExpertDemand]] = None,
         placement: Optional[PlacementSnapshot] = None,
     ) -> Tuple[List[int], List[int], List[int], Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
-        """策略决策入口：构造请求并调用 PDScopeScheduler
-
-        流程：
-        1. 从 selected_experts 构建 expert mask
-        2. 收集活跃专家并组织 token 分配
-        3. 构造 current_demands 和 future_demands
-        4. 更新 GPU 命中统计
-        5. 构造 ExpertLayerRequest 并调用 scheduler.schedule()
-        6. 从 ExpertSchedule 提取 CPU/GPU/preload 专家 id 列表
-
-        Returns:
-            cpu_expert_ids: CPU 执行的专家 id 列表
-            gpu_expert_ids: GPU 执行的专家 id 列表
-            preload_expert_ids: 预加载的专家 id 列表
-            raw_assignments: 原始 (token_indices, routing_weights) 字典
-        """
+        """策略决策入口：构造请求并调用 PDScopeScheduler"""
         active_experts, token_indices_by_expert, raw_assignments = _collect_expert_assignments(
             selected_experts, routing_weights, n_expert
         )
@@ -639,21 +802,9 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
 
         for demand in current_demands:
             on_gpu = placement.is_on_gpu(demand.key.layer, demand.key.expert_id)
-            in_static = (demand.key.layer, demand.key.expert_id) in placement.gpu_resident
-            in_placeholder = (demand.key.layer, demand.key.expert_id) in placement.placeholder_resident
             if on_gpu:
                 self.cnt_expert_hit += demand.token_count
             self.cnt_expert_all += demand.token_count
-        #     if i_layer <= 2:
-        #         print(f"[HitRate] layer={i_layer} expert={demand.key.expert_id} "
-        #               f"tokens={demand.token_count} on_gpu={on_gpu} "
-        #               f"static={in_static} placeholder={in_placeholder} "
-        #               f"|gpu_resident|={len(placement.gpu_resident)} "
-        #               f"|placeholder_resident|={len(placement.placeholder_resident)}")
-        # if i_layer <= 2:
-        #     print(f"[HitRate] layer={i_layer} cumulative hit={self.cnt_expert_hit} "
-        #           f"all={self.cnt_expert_all} rate={self.cnt_expert_hit / max(self.cnt_expert_all, 1):.4f} "
-        #           f"snapshot_gpu_resident_sample={list(placement.gpu_resident)[:5]}")
 
         request = ExpertLayerRequest(
             layer=i_layer,
@@ -663,4 +814,35 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
             assignments=build_assignments(raw_assignments),
         )
         schedule = self.scheduler.schedule(request, placement, self.latency_model)
+
+        if self.stats_recorder is not None:
+            self.stats_recorder.record({
+                "strategy": self.__class__.__name__,
+                "scheduler": self.scheduler.__class__.__name__,
+                "reason": schedule.reason,
+                "layer": i_layer,
+                "phase": "prefill" if is_prefill else "decode",
+                "n_expert": n_expert,
+                "seq_len": selected_experts.shape[1] if selected_experts.dim() >= 2 else 1,
+                "top_k": selected_experts.shape[-1] if selected_experts.dim() >= 1 else 0,
+                "active_experts": active_experts,
+                "cpu_experts": [_demand_to_dict(d) for d in schedule.cpu],
+                "gpu_experts": [_demand_to_dict(d) for d in schedule.gpu],
+                "preload_experts": [_demand_to_dict(d) for d in schedule.preload],
+                "current_demands": [_demand_to_dict(d) for d in current_demands],
+                "future_demands": [_demand_to_dict(d) for d in future],
+                "token_counts": _token_counts_by_expert(token_indices_by_expert),
+                "placement": _placement_summary(placement, current_demands, future),
+                "latency": _latency_summary(self.latency_model),
+                "strategy_params": {
+                    "alpha": self.scheduler.alpha,
+                    "t_attn": self.scheduler.t_attn,
+                    "r_hit": self.scheduler.r_hit,
+                },
+                "counters": {
+                    "expert_hit": self.cnt_expert_hit,
+                    "expert_all": self.cnt_expert_all,
+                },
+            })
+
         return schedule.cpu_expert_ids, schedule.gpu_expert_ids, schedule.preload_expert_ids, raw_assignments

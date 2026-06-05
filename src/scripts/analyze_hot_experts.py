@@ -80,6 +80,7 @@ def parse_args():
     parser.add_argument("--cpu-offload", type=int, default=1, choices=[0, 1], help="0: GPU baseline, 1: CPU offload.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for inference.")
     parser.add_argument("--beam-width", type=int, default=1, help="Beam search width.")
+    parser.set_defaults(record_hot_experts=True, sync_timing=False, profile_expert_executor=False)
     return parser.parse_args()
 
 
