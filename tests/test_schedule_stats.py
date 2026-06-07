@@ -6,7 +6,10 @@ import torch
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
+SRC_DIR = os.path.join(ROOT, "src")
 MODEL_DIR = os.path.join(ROOT, "src", "model")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
@@ -250,3 +253,234 @@ def test_recorder_disabled():
     recorder.enabled = False
     recorder.record({"strategy": "test"})
     assert len(recorder.records) == 0
+
+
+class TestHitSourceCounters:
+    def _make_executor(self):
+        from expert_executor import ExpertExecutionManager
+
+        class FakePlaceholderManager:
+            def is_static_gpu_resident(self, layer, expert_id):
+                return expert_id == 0
+            def get_placeholder_for_expert(self, layer, expert_id):
+                if expert_id == 1:
+                    return lambda x: x
+                return None
+            def acquire_placeholder(self, layer, expert_id):
+                return lambda x: x
+            def protect_expert(self, layer, expert_id):
+                pass
+            def unprotect_expert(self, layer, expert_id):
+                pass
+            def release_by_layer(self, layer):
+                pass
+            def load_weights(self, placeholder, expert):
+                pass
+
+        cpu_experts = {(1, eid): torch.nn.Linear(4, 4) for eid in range(64)}
+        executor = ExpertExecutionManager(
+            device="cpu",
+            placeholder_manager=FakePlaceholderManager(),
+            model=None,
+            is_expert_in_gpu=lambda l, e: e == 0,
+            cpu_experts=cpu_experts,
+        )
+        original_get = executor.get_cpu_expert
+        def safe_get_cpu_expert(layer, expert_id):
+            key = (layer, expert_id)
+            if key in executor.cpu_experts:
+                return executor.cpu_experts[key]
+            return original_get(layer, expert_id)
+        executor.get_cpu_expert = safe_get_cpu_expert
+        return executor
+
+    def _make_context(self, expert_ids, n_tokens=2):
+        from expert_types import ExpertLayerContext, ExpertAssignment
+        inps = torch.randn(n_tokens, 4)
+        fake_experts = {eid: torch.nn.Linear(4, 4) for eid in expert_ids}
+        assignments = {}
+        for eid in expert_ids:
+            assignments[eid] = ExpertAssignment(
+                expert_id=eid,
+                token_indices=torch.arange(n_tokens),
+                routing_weights=torch.ones(n_tokens, 1),
+            )
+        return ExpertLayerContext(
+            layer=1,
+            experts=fake_experts,
+            inps_flat=inps,
+            hidden_dim=4,
+            assignments=assignments,
+        )
+
+    def test_static_gpu_hit_counter(self):
+        executor = self._make_executor()
+        ctx = self._make_context([0])
+        executor.execute_gpu_experts(ctx, [0])
+        assert executor.static_gpu_hit_count == 1
+        assert executor.static_gpu_hit_tokens == 2
+        assert executor.placeholder_hit_count == 0
+        assert executor.ondemand_load_count == 0
+
+    def test_placeholder_hit_counter(self):
+        executor = self._make_executor()
+        ctx = self._make_context([1])
+        executor.execute_gpu_experts(ctx, [1])
+        assert executor.placeholder_hit_count == 1
+        assert executor.placeholder_hit_tokens == 2
+        assert executor.static_gpu_hit_count == 0
+        assert executor.ondemand_load_count == 0
+
+    def test_ondemand_load_counter(self):
+        executor = self._make_executor()
+        ctx = self._make_context([5])
+        executor.execute_gpu_experts(ctx, [5])
+        assert executor.ondemand_load_count == 1
+        assert executor.ondemand_load_tokens == 2
+        assert executor.static_gpu_hit_count == 0
+        assert executor.placeholder_hit_count == 0
+
+    def test_mixed_counters(self):
+        executor = self._make_executor()
+        ctx = self._make_context([0, 1, 5], n_tokens=3)
+        executor.execute_gpu_experts(ctx, [0, 1, 5])
+        assert executor.static_gpu_hit_count == 1
+        assert executor.placeholder_hit_count == 1
+        assert executor.ondemand_load_count == 1
+        assert executor.static_gpu_hit_tokens == 3
+        assert executor.placeholder_hit_tokens == 3
+        assert executor.ondemand_load_tokens == 3
+
+    def test_wait_for_preload_returns_false_on_cpu(self):
+        executor = self._make_executor()
+        assert executor._wait_for_preload(1, 1) is False
+
+
+class TestPreloadOverlap:
+    def _make_records(self):
+        return [
+            {
+                "call_index": 0,
+                "layer": 3,
+                "phase": "decode",
+                "reason": "decode-mode-b",
+                "preload_experts": [
+                    {"expert_id": 1, "layer": 4, "token_count": 1, "score": 1.0, "source": "predicted"},
+                    {"expert_id": 2, "layer": 4, "token_count": 1, "score": 0.9, "source": "predicted"},
+                ],
+                "gpu_experts": [],
+                "cpu_experts": [],
+                "current_demands": [],
+            },
+            {
+                "call_index": 1,
+                "layer": 4,
+                "phase": "decode",
+                "reason": "decode-mode-c",
+                "preload_experts": [],
+                "gpu_experts": [{"expert_id": 2}],
+                "cpu_experts": [{"expert_id": 3}],
+                "current_demands": [
+                    {"expert_id": 2, "layer": 4, "token_count": 1, "score": 1.0, "source": "current"},
+                    {"expert_id": 3, "layer": 4, "token_count": 1, "score": 0.8, "source": "current"},
+                ],
+            },
+        ]
+
+    def test_basic_overlap(self):
+        SCRIPTS_DIR = os.path.join(ROOT, "src", "scripts")
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from analyze_schedule import compute_preload_overlap
+
+        records = self._make_records()
+        result = compute_preload_overlap(records)
+        assert result["preload_calls"] == 1
+        assert result["total_preloaded"] == 2
+        assert result["matched_next_calls"] == 1
+        assert result["overlap_count"] == 1
+        assert result["total_next_demands"] == 2
+        assert result["precision"] == 0.5
+        assert result["next_coverage"] == 0.5
+        assert result["wasted_preload"] == 1
+
+    def test_no_preload_records(self):
+        SCRIPTS_DIR = os.path.join(ROOT, "src", "scripts")
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from analyze_schedule import compute_preload_overlap
+
+        result = compute_preload_overlap([{"layer": 1, "phase": "decode", "preload_experts": []}])
+        assert result["preload_calls"] == 0
+        assert result["precision"] == 0.0
+
+    def test_unmatched_next_layer(self):
+        SCRIPTS_DIR = os.path.join(ROOT, "src", "scripts")
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from analyze_schedule import compute_preload_overlap
+
+        records = [
+            {
+                "call_index": 0,
+                "layer": 3,
+                "phase": "decode",
+                "reason": "decode-mode-b",
+                "preload_experts": [{"expert_id": 1, "layer": 4, "token_count": 1, "score": 1.0, "source": "predicted"}],
+                "gpu_experts": [],
+                "cpu_experts": [],
+                "current_demands": [],
+            },
+        ]
+        result = compute_preload_overlap(records)
+        assert result["preload_calls"] == 1
+        assert result["total_preloaded"] == 1
+        assert result["matched_next_calls"] == 0
+        assert result["overlap_count"] == 0
+        assert result["wasted_preload"] == 1
+
+    def test_by_reason_breakdown(self):
+        SCRIPTS_DIR = os.path.join(ROOT, "src", "scripts")
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from analyze_schedule import compute_preload_overlap
+
+        records = [
+            {
+                "call_index": 0,
+                "layer": 3,
+                "phase": "decode",
+                "reason": "decode-mode-b",
+                "preload_experts": [{"expert_id": 1, "layer": 4, "token_count": 1, "score": 1.0, "source": "predicted"}],
+                "gpu_experts": [],
+                "cpu_experts": [],
+                "current_demands": [],
+            },
+            {
+                "call_index": 1,
+                "layer": 4,
+                "phase": "decode",
+                "reason": "decode-mode-c",
+                "preload_experts": [],
+                "gpu_experts": [{"expert_id": 1}],
+                "cpu_experts": [],
+                "current_demands": [{"expert_id": 1, "layer": 4, "token_count": 1, "score": 1.0, "source": "current"}],
+            },
+        ]
+        result = compute_preload_overlap(records)
+        assert "decode-mode-b" in result["by_reason"]
+        assert result["by_reason"]["decode-mode-b"]["calls"] == 1
+        assert result["by_reason"]["decode-mode-b"]["overlap"] == 1
+
+    def test_examples_with_limit(self):
+        SCRIPTS_DIR = os.path.join(ROOT, "src", "scripts")
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from analyze_schedule import compute_preload_overlap
+
+        records = self._make_records()
+        result = compute_preload_overlap(records, limit=5)
+        assert len(result["examples"]) == 1
+        ex = result["examples"][0]
+        assert ex["overlap"] == [2]
+        assert ex["precision"] == 0.5

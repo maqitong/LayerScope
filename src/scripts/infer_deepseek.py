@@ -39,6 +39,50 @@ def print_runtime_state(model, label):
     )
 
 
+def print_executor_hit_sources(model, hit_source_log=None):
+    ex = model.expert_executor
+    total_gpu_hits = ex.static_gpu_hit_count + ex.placeholder_hit_count + ex.ondemand_load_count
+    total_gpu_tokens = ex.static_gpu_hit_tokens + ex.placeholder_hit_tokens + ex.ondemand_load_tokens
+    placeholder_hit_rate = ex.placeholder_hit_count / max(total_gpu_hits, 1)
+    preload_of_placeholder_rate = ex.preload_hit_count / max(ex.placeholder_hit_count, 1)
+    preload_of_success_rate = ex.preload_hit_count / max(ex.preload_success_count, 1)
+    preload_of_request_rate = ex.preload_hit_count / max(ex.preload_request_count, 1)
+    print(f"[hit-source] static_gpu_hit={ex.static_gpu_hit_count} (tokens={ex.static_gpu_hit_tokens})")
+    print(f"[hit-source] placeholder_hit={ex.placeholder_hit_count} (tokens={ex.placeholder_hit_tokens})")
+    print(f"[hit-source] ondemand_load={ex.ondemand_load_count} (tokens={ex.ondemand_load_tokens})")
+    print(f"[hit-source] preload_hit={ex.preload_hit_count} (of placeholder hits)")
+    print(f"[hit-source] total_gpu_experts={total_gpu_hits} (tokens={total_gpu_tokens})")
+    print(f"[hit-source] placeholder_hit_rate={placeholder_hit_rate:.4f} (placeholder / total_gpu)")
+    print(f"[hit-source] preload_hit/placeholder={preload_of_placeholder_rate:.4f}")
+    print(f"[hit-source] preload_hit/preload_success={preload_of_success_rate:.4f}")
+    print(f"[hit-source] preload_hit/preload_request={preload_of_request_rate:.4f}")
+
+    if hit_source_log:
+        record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "static_gpu_hit_count": ex.static_gpu_hit_count,
+            "static_gpu_hit_tokens": ex.static_gpu_hit_tokens,
+            "placeholder_hit_count": ex.placeholder_hit_count,
+            "placeholder_hit_tokens": ex.placeholder_hit_tokens,
+            "ondemand_load_count": ex.ondemand_load_count,
+            "ondemand_load_tokens": ex.ondemand_load_tokens,
+            "preload_hit_count": ex.preload_hit_count,
+            "preload_request_count": ex.preload_request_count,
+            "preload_success_count": ex.preload_success_count,
+            "preload_skip_count": ex.preload_skip_count,
+            "total_gpu_hits": total_gpu_hits,
+            "total_gpu_tokens": total_gpu_tokens,
+            "placeholder_hit_rate": placeholder_hit_rate,
+            "preload_of_placeholder_rate": preload_of_placeholder_rate,
+            "preload_of_success_rate": preload_of_success_rate,
+            "preload_of_request_rate": preload_of_request_rate,
+        }
+        os.makedirs(os.path.dirname(hit_source_log) or ".", exist_ok=True)
+        with open(hit_source_log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, indent=4) + "\n")
+        print(f"[hit-source] Saved to {hit_source_log}")
+
+
 def print_expert_timing(model):
     lines = model.expert_executor.format_timing_summary()
     if not lines:
@@ -162,6 +206,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to write scheduling decision JSONL. If omitted, records are kept in memory only.",
     )
+    parser.add_argument(
+        "--hit-source-log",
+        type=str,
+        default=None,
+        help="Path to write hit-source stats JSONL (e.g. logs/hit_source_${TIMESTAMP}.jsonl).",
+    )
 
     args = parser.parse_args()
     model = mDeepSeek(args)
@@ -223,7 +273,9 @@ if __name__ == "__main__":
     if args.profile_expert_executor:
         print_expert_timing(model)
         print_placeholder_hit_rate(model)
-        
+
+    print_executor_hit_sources(model, hit_source_log=args.hit_source_log)
+
     print(
         f"prefill_time: {prefill_time:.4f}, decode_time: {decode_time:.4f}, hit_rate: {hit_rate:.4f}"
     )

@@ -56,8 +56,8 @@ class mDeepSeek:
             template_expert=template_expert,
             device=self.dev,
             num_placeholders= 2 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
-            # eviction_strategy=FIFOEvictionStrategy(),
-            eviction_strategy=LRUEvictionStrategy(),
+            eviction_strategy=FIFOEvictionStrategy(),
+            # eviction_strategy=LRUEvictionStrategy(),
         )
         self.expert_placeholder = self.placeholder_manager._placeholders[0]
 
@@ -81,7 +81,7 @@ class mDeepSeek:
 
         ### 加载基准数据，设置专家调度策略的 CPU/GPU 延迟参数
         self.latency_cpu = 0.142
-        self.latency_copy = 0.86
+        self.latency_copy = 0.4
         self.latency_gpu = 0.093 #ms
         self.latency_cpu_table = {1: 0.142}
         self.latency_gpu_table = {1: 0.093}
@@ -291,9 +291,12 @@ class mDeepSeek:
         print(f"Number of parameters in a single expert: {n_param}, memory: {expert_mem_mb:.2f} MB")
 
         total_mem = torch.cuda.get_device_properties(self.dev).total_memory
+        
         # 70% of total memory for safety margin
         #torch.cuda.memory_allocated：PyTorch 官方提供的显存统计 API，专门统计已使用的显存
-        free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
+        # free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
+        free_mem = total_mem * 0.20 - torch.cuda.memory_reserved(self.dev)
+        
         print(f"Total GPU memory: {total_mem / 1024 / 1024:.2f} MB, Free GPU memory: {free_mem / 1024 / 1024:.2f} MB")
         return int(free_mem // (n_param * 2))
 
@@ -483,6 +486,12 @@ class mDeepSeek:
             self.expert_executor.preload_success_count = 0
             self.expert_executor.preload_skip_count = 0
             self.expert_executor.preload_hit_count = 0
+            self.expert_executor.static_gpu_hit_count = 0
+            self.expert_executor.static_gpu_hit_tokens = 0
+            self.expert_executor.placeholder_hit_count = 0
+            self.expert_executor.placeholder_hit_tokens = 0
+            self.expert_executor.ondemand_load_count = 0
+            self.expert_executor.ondemand_load_tokens = 0
             self.expert_executor.reset_timing_stats()
 
         if clear_placeholders:

@@ -740,7 +740,7 @@ class PDScopeScheduler(ExpertScheduler):
         future = [d for d in global_queue if d.source == "predicted"]
         future.sort(key=lambda d: (d.score, d.token_count), reverse=True)
         return future[:capacity]
-
+        # return future[:]
 
 class PrefetchHybridStrategy(ExpertSchedulingStrategy):
     """PDScope AdaptSched 调度策略：区分 Prefill 三步调度法和 Decode ABC 策略

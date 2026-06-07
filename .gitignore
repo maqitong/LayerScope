@@ -5,9 +5,6 @@ __pycache__/
 *$py.class
 
 # 测试结果和日志
-30-resource/*
-20-PDScope/*
-10-fiddler-main/*
 datasets/*
 docs/*
 # 旧文件（已融合到CLAUDE.md）
@@ -21,3 +18,5 @@ logs/
 .codegraph/
 实验*
 PDScope*
+CLAUDE.md
+nsys_reports/

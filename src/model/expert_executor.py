@@ -27,6 +27,12 @@ class ExpertExecutionManager:
         self.preload_success_count = 0
         self.preload_skip_count = 0
         self.preload_hit_count = 0
+        self.static_gpu_hit_count = 0
+        self.static_gpu_hit_tokens = 0
+        self.placeholder_hit_count = 0
+        self.placeholder_hit_tokens = 0
+        self.ondemand_load_count = 0
+        self.ondemand_load_tokens = 0
 
     def execute(self, schedule: ExpertSchedule, context: ExpertLayerContext) -> torch.Tensor:
         gpu_result = None
@@ -181,12 +187,19 @@ class ExpertExecutionManager:
         for expert_id in expert_ids:
             assignment = context.assignments[expert_id]
             token_indices = assignment.token_indices.to(self.device).long().contiguous()
+            n_tokens = token_indices.shape[0]
             current_state = context.inps_flat.index_select(0, token_indices)
             placeholder = self.placeholder_manager.get_placeholder_for_expert(context.layer, expert_id)
             if self.placeholder_manager.is_static_gpu_resident(context.layer, expert_id):
+                self.static_gpu_hit_count += 1
+                self.static_gpu_hit_tokens += n_tokens
                 current_state = context.experts[expert_id](current_state)
             elif placeholder is not None:
-                self._wait_for_preload(context.layer, expert_id)
+                was_preloaded = self._wait_for_preload(context.layer, expert_id)
+                self.placeholder_hit_count += 1
+                self.placeholder_hit_tokens += n_tokens
+                if was_preloaded:
+                    self.preload_hit_count += 1
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
                 try:
                     current_state = placeholder(current_state)
@@ -194,6 +207,8 @@ class ExpertExecutionManager:
                     self.placeholder_manager.unprotect_expert(context.layer, expert_id)
                 self.placeholder_manager.release_by_layer(context.layer)
             else:
+                self.ondemand_load_count += 1
+                self.ondemand_load_tokens += n_tokens
                 placeholder = self.placeholder_manager.acquire_placeholder(context.layer, expert_id)
                 if placeholder is None:
                     raise RuntimeError(f"No placeholder available for expert ({context.layer}, {expert_id})")
@@ -279,13 +294,15 @@ class ExpertExecutionManager:
         with self._preload_event_lock:
             self._preload_events[(layer, expert_id)] = event
 
-    def _wait_for_preload(self, layer: int, expert_id: int) -> None:
+    def _wait_for_preload(self, layer: int, expert_id: int) -> bool:
         if self.compute_stream is None:
-            return
+            return False
         with self._preload_event_lock:
             event = self._preload_events.pop((layer, expert_id), None)
         if event is not None:
             self.compute_stream.wait_event(event)
+            return True
+        return False
 
     def _discard_preload_event(self, layer: int, expert_id: int) -> None:
         with self._preload_event_lock:

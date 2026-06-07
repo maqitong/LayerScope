@@ -382,6 +382,162 @@ def print_summary(records: List[Dict]) -> None:
         print(f"{layer:>6} {ls['total']:>6} {ls['suboptimal']:>7} {pct:>7.1f}% {avg:>10.4f}")
 
 
+def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
+    """Compute overlap between preloaded experts and next-layer actual demands.
+
+    For each record with non-empty preload_experts targeting layer N+1, find
+    the next scheduling record for layer N+1 (same phase, later in file order)
+    and compare preload set vs actual current_demands.
+
+    Returns aggregate metrics and per-record details.
+    """
+    preload_records = []
+    for idx, rec in enumerate(records):
+        preload_exps = rec.get("preload_experts", [])
+        if not preload_exps:
+            continue
+        preload_records.append((idx, rec))
+
+    if not preload_records:
+        return {
+            "preload_calls": 0,
+            "total_preloaded": 0,
+            "matched_next_calls": 0,
+            "overlap_count": 0,
+            "total_next_demands": 0,
+            "precision": 0.0,
+            "next_coverage": 0.0,
+            "wasted_preload": 0,
+            "by_reason": {},
+            "examples": [],
+        }
+
+    total_preloaded = 0
+    overlap_count = 0
+    total_next_demands = 0
+    matched = 0
+    wasted = 0
+    by_reason = defaultdict(lambda: {"calls": 0, "preloaded": 0, "overlap": 0, "next_demands": 0, "wasted": 0})
+    examples = []
+
+    for idx, rec in preload_records:
+        preload_exps = rec.get("preload_experts", [])
+        if isinstance(preload_exps[0], dict):
+            preload_ids = set(e["expert_id"] for e in preload_exps)
+        else:
+            preload_ids = set(preload_exps)
+        target_layer = rec.get("layer", -1) + 1
+        phase = rec.get("phase", "")
+        reason = rec.get("reason", "unknown")
+        total_preloaded += len(preload_ids)
+
+        next_rec = None
+        for j in range(idx + 1, len(records)):
+            candidate = records[j]
+            if candidate.get("layer") == target_layer and candidate.get("phase") == phase:
+                next_rec = candidate
+                break
+            if candidate.get("layer") == rec.get("layer") and candidate.get("phase") == phase:
+                break
+
+        if next_rec is not None:
+            matched += 1
+            next_demands = next_rec.get("current_demands", [])
+            if isinstance(next_demands, list) and next_demands and isinstance(next_demands[0], dict):
+                next_ids = set(d["expert_id"] for d in next_demands)
+            else:
+                next_ids = set()
+            total_next_demands += len(next_ids)
+            overlap = preload_ids & next_ids
+            overlap_count += len(overlap)
+            w = len(preload_ids) - len(overlap)
+            wasted += w
+
+            br = by_reason[reason]
+            br["calls"] += 1
+            br["preloaded"] += len(preload_ids)
+            br["overlap"] += len(overlap)
+            br["next_demands"] += len(next_ids)
+            br["wasted"] += w
+
+            if limit > 0 and len(examples) < limit:
+                examples.append({
+                    "call_index": rec.get("call_index"),
+                    "layer": rec.get("layer"),
+                    "phase": phase,
+                    "reason": reason,
+                    "preload_ids": sorted(preload_ids),
+                    "next_actual_ids": sorted(next_ids),
+                    "overlap": sorted(overlap),
+                    "precision": round(len(overlap) / max(len(preload_ids), 1), 4),
+                    "wasted": w,
+                })
+        else:
+            wasted += len(preload_ids)
+            br = by_reason[reason]
+            br["calls"] += 1
+            br["preloaded"] += len(preload_ids)
+            br["wasted"] += len(preload_ids)
+
+            if limit > 0 and len(examples) < limit:
+                examples.append({
+                    "call_index": rec.get("call_index"),
+                    "layer": rec.get("layer"),
+                    "phase": phase,
+                    "reason": reason,
+                    "preload_ids": sorted(preload_ids),
+                    "next_actual_ids": None,
+                    "overlap": [],
+                    "precision": 0.0,
+                    "wasted": len(preload_ids),
+                    "note": "no matching next-layer record found",
+                })
+
+    return {
+        "preload_calls": len(preload_records),
+        "total_preloaded": total_preloaded,
+        "matched_next_calls": matched,
+        "overlap_count": overlap_count,
+        "total_next_demands": total_next_demands,
+        "precision": round(overlap_count / max(total_preloaded, 1), 4),
+        "next_coverage": round(overlap_count / max(total_next_demands, 1), 4),
+        "wasted_preload": wasted,
+        "by_reason": {r: dict(v) for r, v in sorted(by_reason.items())},
+        "examples": examples,
+    }
+
+
+def print_preload_overlap(records: List[Dict], limit: int = 0) -> None:
+    result = compute_preload_overlap(records, limit=limit)
+    print(f"\n{'='*80}")
+    print("Preload Overlap Analysis")
+    print(f"{'='*80}")
+    print(f"preload_calls:        {result['preload_calls']}")
+    print(f"total_preloaded:      {result['total_preloaded']}")
+    print(f"matched_next_calls:   {result['matched_next_calls']}")
+    print(f"overlap_count:        {result['overlap_count']}")
+    print(f"total_next_demands:   {result['total_next_demands']}")
+    print(f"precision:            {result['precision']:.4f}  (overlap / total_preloaded)")
+    print(f"next_coverage:        {result['next_coverage']:.4f}  (overlap / total_next_demands)")
+    print(f"wasted_preload:       {result['wasted_preload']}")
+
+    if result["by_reason"]:
+        print(f"\n{'─'*80}")
+        print(f"{'reason':<30} {'calls':>6} {'preloaded':>10} {'overlap':>8} {'next_dem':>8} {'wasted':>8}")
+        print(f"{'─'*80}")
+        for reason, stats in result["by_reason"].items():
+            print(f"{reason:<30} {stats['calls']:>6} {stats['preloaded']:>10} {stats['overlap']:>8} {stats['next_demands']:>8} {stats['wasted']:>8}")
+
+    if result["examples"]:
+        print(f"\n{'─'*80}")
+        print(f"Examples (limit={limit}):")
+        for ex in result["examples"]:
+            note = f"  ({ex['note']})" if "note" in ex else ""
+            print(f"  call_index={ex['call_index']} layer={ex['layer']} phase={ex['phase']} reason={ex['reason']}")
+            print(f"    preload={ex['preload_ids']}  next_actual={ex['next_actual_ids']}  overlap={ex['overlap']}")
+            print(f"    precision={ex['precision']:.4f}  wasted={ex['wasted']}{note}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="分析 schedule.jsonl 中每条调度记录的逐步决策过程和最优性。",
@@ -416,6 +572,10 @@ def main():
         "--limit", type=int, default=0,
         help="最多显示多少条记录（0=不限制）",
     )
+    parser.add_argument(
+        "--preload-overlap", action="store_true",
+        help="分析预加载专家与下一层实际需求的重叠情况",
+    )
     args = parser.parse_args()
 
     records = load_records(args.jsonl_path)
@@ -423,6 +583,10 @@ def main():
 
     if args.summary:
         print_summary(records)
+        return
+
+    if args.preload_overlap:
+        print_preload_overlap(records, limit=args.limit)
         return
 
     filtered = records
