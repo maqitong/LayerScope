@@ -7,7 +7,7 @@ import random
 import torch.cuda.nvtx as nvtx
 from torch.profiler import profile, record_function, ProfilerActivity
 
-from model.deepseek import mDeepSeek
+from models.deepseek import mDeepSeek
 
 
 def load_prompts_from_dataset(dataset_path, batch_size, seed=42):
@@ -24,62 +24,35 @@ def load_prompts_from_dataset(dataset_path, batch_size, seed=42):
 
 
 def print_runtime_state(model, label):
-    placement = model.placeholder_manager.snapshot()
     executor = model.expert_executor
+    placeholder = model.monitor.placeholder_summary(model.placeholder_manager)
     print(
         f"[{label}] "
-        f"placeholder_resident={len(placement.placeholder_resident)} "
-        f"free_placeholders={placement.free_placeholders} "
-        f"loading={len(placement.loading)} "
+        f"placeholder_resident={placeholder['placeholder_resident']} "
+        f"free_placeholders={placeholder['free_placeholders']} "
+        f"loading={placeholder['loading']} "
         f"preload_request={executor.preload_request_count} "
         f"preload_success={executor.preload_success_count} "
         f"preload_skip={executor.preload_skip_count} "
         f"preload_hit={executor.preload_hit_count} "
-        f"eviction={model.placeholder_manager.eviction_count}"
+        f"eviction={placeholder['eviction_count']}"
     )
 
 
 def print_executor_hit_sources(model, hit_source_log=None):
-    ex = model.expert_executor
-    total_gpu_hits = ex.static_gpu_hit_count + ex.placeholder_hit_count + ex.ondemand_load_count
-    total_gpu_tokens = ex.static_gpu_hit_tokens + ex.placeholder_hit_tokens + ex.ondemand_load_tokens
-    placeholder_hit_rate = ex.placeholder_hit_count / max(total_gpu_hits, 1)
-    preload_of_placeholder_rate = ex.preload_hit_count / max(ex.placeholder_hit_count, 1)
-    preload_of_success_rate = ex.preload_hit_count / max(ex.preload_success_count, 1)
-    preload_of_request_rate = ex.preload_hit_count / max(ex.preload_request_count, 1)
-    print(f"[hit-source] static_gpu_hit={ex.static_gpu_hit_count} (tokens={ex.static_gpu_hit_tokens})")
-    print(f"[hit-source] placeholder_hit={ex.placeholder_hit_count} (tokens={ex.placeholder_hit_tokens})")
-    print(f"[hit-source] ondemand_load={ex.ondemand_load_count} (tokens={ex.ondemand_load_tokens})")
-    print(f"[hit-source] preload_hit={ex.preload_hit_count} (of placeholder hits)")
-    print(f"[hit-source] total_gpu_experts={total_gpu_hits} (tokens={total_gpu_tokens})")
-    print(f"[hit-source] placeholder_hit_rate={placeholder_hit_rate:.4f} (placeholder / total_gpu)")
-    print(f"[hit-source] preload_hit/placeholder={preload_of_placeholder_rate:.4f}")
-    print(f"[hit-source] preload_hit/preload_success={preload_of_success_rate:.4f}")
-    print(f"[hit-source] preload_hit/preload_request={preload_of_request_rate:.4f}")
+    summary = model.monitor.hit_source_summary(model.expert_executor)
+    print(f"[hit-source] static_gpu_hit={summary['static_gpu_hit_count']} (tokens={summary['static_gpu_hit_tokens']})")
+    print(f"[hit-source] placeholder_hit={summary['placeholder_hit_count']} (tokens={summary['placeholder_hit_tokens']})")
+    print(f"[hit-source] ondemand_load={summary['ondemand_load_count']} (tokens={summary['ondemand_load_tokens']})")
+    print(f"[hit-source] preload_hit={summary['preload_hit_count']} (of placeholder hits)")
+    print(f"[hit-source] total_gpu_experts={summary['total_gpu_hits']} (tokens={summary['total_gpu_tokens']})")
+    print(f"[hit-source] placeholder_hit_rate={summary['placeholder_hit_rate']:.4f} (placeholder / total_gpu)")
+    print(f"[hit-source] preload_hit/placeholder={summary['preload_of_placeholder_rate']:.4f}")
+    print(f"[hit-source] preload_hit/preload_success={summary['preload_of_success_rate']:.4f}")
+    print(f"[hit-source] preload_hit/preload_request={summary['preload_of_request_rate']:.4f}")
 
     if hit_source_log:
-        record = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "static_gpu_hit_count": ex.static_gpu_hit_count,
-            "static_gpu_hit_tokens": ex.static_gpu_hit_tokens,
-            "placeholder_hit_count": ex.placeholder_hit_count,
-            "placeholder_hit_tokens": ex.placeholder_hit_tokens,
-            "ondemand_load_count": ex.ondemand_load_count,
-            "ondemand_load_tokens": ex.ondemand_load_tokens,
-            "preload_hit_count": ex.preload_hit_count,
-            "preload_request_count": ex.preload_request_count,
-            "preload_success_count": ex.preload_success_count,
-            "preload_skip_count": ex.preload_skip_count,
-            "total_gpu_hits": total_gpu_hits,
-            "total_gpu_tokens": total_gpu_tokens,
-            "placeholder_hit_rate": placeholder_hit_rate,
-            "preload_of_placeholder_rate": preload_of_placeholder_rate,
-            "preload_of_success_rate": preload_of_success_rate,
-            "preload_of_request_rate": preload_of_request_rate,
-        }
-        os.makedirs(os.path.dirname(hit_source_log) or ".", exist_ok=True)
-        with open(hit_source_log, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, indent=4) + "\n")
+        model.monitor.write_hit_source_log(hit_source_log, model.expert_executor)
         print(f"[hit-source] Saved to {hit_source_log}")
 
 
@@ -284,7 +257,7 @@ if __name__ == "__main__":
     print("tokens per second (decode):", args.output_token_num / decode_time)
 
     if args.record_expert_schedule and hasattr(model, "schedule_stats_recorder") and model.schedule_stats_recorder is not None:
-        summary = model.schedule_stats_recorder.summary()
+        summary = model.monitor.schedule_summary()
         print(f"[schedule-stats] Total scheduling calls: {summary['total_calls']}")
         for row in summary.get("by_layer", []):
             print(

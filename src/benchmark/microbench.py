@@ -1,399 +1,303 @@
-"""Microbenchmarking for DeepSeek-V2-Lite CPU offloading"""
+"""Runtime microbenchmark for DeepSeek-V2-Lite using real inference operators.
+
+Drives mDeepSeek.generate() through the full runtime path:
+  gate routing -> expert_strategy -> ExpertExecutionManager -> placeholder/preload
+and collects timing from RuntimeMonitor + ExpertExecutionManager.
+"""
 
 import argparse
-import copy
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime
 
 import numpy as np
 import torch
-import torch.nn as nn
-import transformers
-from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2RotaryEmbedding
-from transformers.masking_utils import create_causal_mask
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from model.deepseek import mDeepSeek
-from model.placeholder_manager import ExpertPlaceholderManager
-
-WEIGHT_NAMES = ['gate_proj', 'up_proj', 'down_proj']
+from models.deepseek import mDeepSeek
 
 
-def bench_expert_cpu(model, token_counts=None, n_repeat=20):
-    """测量单个 expert 在 CPU 上不同 token 数量时的计算时间
+def load_prompts_from_dataset(dataset_path, batch_size, seed=42):
+    rng = random.Random(seed)
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    all_prompts = []
+    for conv in data:
+        for turn in conv.get("conversations", []):
+            if turn.get("from") == "human":
+                all_prompts.append(turn["value"])
+                break
+    return rng.sample(all_prompts, min(batch_size, len(all_prompts)))
 
-    Args:
-        model: mDeepSeek 实例
-        token_counts: 要测量的 token 数量列表
-        n_repeat: 每个 token 数量重复测量的次数
 
-    Returns:
-        list[(token_count, avg_time_ms)]: 每个 token 数量对应的平均计算时间
-    """
-    if token_counts is None:
-        token_counts = list(range(1, 250))
-    hidden_dim = model.config.hidden_size
-    expert = model.model.layers[1].mlp.experts[0]
-    expert.to("cpu")
-
+def bench_runtime_generate(model, prompts, input_token, output_token,
+                           warmup=0, preserve_warmup_cache=False):
     results = []
-    for tc in token_counts:
-        inps = torch.randn(tc, hidden_dim, dtype=model.dtype, device="cpu")
-        _ = expert(inps)
 
-        measurements = []
-        for _ in range(n_repeat):
-            torch.cuda.synchronize()
-            tick = time.time()
-            _ = expert(inps)
-            torch.cuda.synchronize()
-            measurements.append(time.time() - tick)
-        avg_ms = np.mean(measurements) * 1000
-        results.append((tc, avg_ms))
+    for i in range(warmup):
+        print(f"warmup {i + 1}/{warmup}")
+        model.generate(
+            prompts,
+            output_token=output_token,
+            input_token=input_token,
+        )
 
-    expert.to(model.dev)
-    return results
+    if warmup > 0 and not preserve_warmup_cache:
+        model.reset_runtime_state(clear_placeholders=True)
 
+    for rep in range(1):
+        prefill_time, decode_time, hit_rate = model.generate(
+            prompts,
+            output_token=output_token,
+            input_token=input_token,
+        )
 
-def bench_expert_gpu(model, token_counts=None, n_repeat=10):
-    """测量单个 expert 在 GPU 上不同 token 数量时的计算时间
+        input_tok = input_token if input_token is not None else 0
+        prefill_throughput = (input_tok / prefill_time) if prefill_time > 0 else 0.0
+        decode_throughput = (output_token / decode_time) if decode_time > 0 else 0.0
 
-    Args:
-        model: mDeepSeek 实例
-        token_counts: 要测量的 token 数量列表
-        n_repeat: 每个 token 数量重复测量的次数
+        expert_timing = model.expert_executor.timing_summary()
 
-    Returns:
-        list[(token_count, avg_time_ms)]: 每个 token 数量对应的平均计算时间
-    """
-    if token_counts is None:
-        token_counts = list(range(1, 250))
-    hidden_dim = model.config.hidden_size
-    expert = model.model.layers[1].mlp.experts[1]
-    expert.to(model.dev)
+        runtime_summary = model.monitor.runtime_summary(
+            model.expert_executor, model.placeholder_manager
+        )
 
-    results = []
-    for tc in token_counts:
-        inps = torch.randn(tc, hidden_dim, dtype=model.dtype, device=model.dev)
-        _ = expert(inps)
+        results.append({
+            "prefill_time_s": round(prefill_time, 6),
+            "decode_time_s": round(decode_time, 6),
+            "hit_rate": round(hit_rate, 6),
+            "input_token_num": input_tok,
+            "output_token_num": output_token,
+            "prefill_throughput_tokens_per_s": round(prefill_throughput, 4),
+            "decode_throughput_tokens_per_s": round(decode_throughput, 4),
+        })
 
-        measurements = []
-        for _ in range(n_repeat):
-            torch.cuda.synchronize()
-            tick = time.time()
-            _ = expert(inps)
-            torch.cuda.synchronize()
-            measurements.append(time.time() - tick)
-        avg_ms = np.mean(measurements) * 1000
-        results.append((tc, avg_ms))
-
-    expert.to("cpu")
-    return results
+    return results, expert_timing, runtime_summary
 
 
-def summarize_measurements(results):
-    values_ms = np.array(results) * 1000
+def estimate_latency_fields(expert_timing, model):
+    total_gpu = 0.0
+    total_cpu = 0.0
+    total_preload = 0.0
+    total_calls = 0.0
+    for row in expert_timing:
+        total_gpu += row.get("gpu", 0.0)
+        total_cpu += row.get("cpu", 0.0)
+        total_preload += row.get("preload", 0.0)
+        total_calls += row.get("calls", 0.0)
+
+    if total_calls > 0:
+        gpu_avg_ms = (total_gpu / total_calls) * 1000
+        cpu_avg_ms = (total_cpu / total_calls) * 1000
+        preload_calls = model.expert_executor.preload_success_count
+        copy_avg_ms = (total_preload / max(preload_calls, 1)) * 1000 if total_preload > 0 else model.latency_copy
+    else:
+        gpu_avg_ms = model.latency_gpu
+        cpu_avg_ms = model.latency_cpu
+        copy_avg_ms = model.latency_copy
+
+    fallback_notes = []
+    if total_calls == 0:
+        fallback_notes.append("no expert executor calls; using model default latency")
+    if total_preload == 0:
+        fallback_notes.append("no preload timing; copy estimate may be imprecise")
+
     return {
-        "trials_ms": [round(t, 4) for t in values_ms],
-        "avg_ms": round(float(np.mean(values_ms)), 4),
-        "median_ms": round(float(np.median(values_ms)), 4),
-        "p95_ms": round(float(np.percentile(values_ms, 95)), 4),
+        "gpu_avg_ms": round(gpu_avg_ms, 4),
+        "cpu_avg_ms": round(cpu_avg_ms, 4),
+        "copy_avg_ms": round(copy_avg_ms, 4),
+        "fallback_notes": fallback_notes,
     }
 
 
-def bench_expert_weight_copy(model, n_repeat=30, n_warmup=5):
-    """测量 expert 权重从 CPU 搬运到 GPU 的时间
+def build_benchmark_json(args, generation_results, expert_timing, runtime_summary,
+                         latency_estimates):
+    expert_cpu_list = [{"token_count": 1, "avg_time_ms": latency_estimates["cpu_avg_ms"]}]
+    expert_gpu_list = [{"token_count": 1, "avg_time_ms": latency_estimates["gpu_avg_ms"]}]
+    copy_ms = latency_estimates["copy_avg_ms"]
 
-    使用 pin_memory + copy_ 方式，与实际推理一致。
+    data = {
+        "benchmark_type": "runtime_generate",
+        "model_name": os.path.basename(args.model.rstrip("/")).lower(),
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "batch_size": args.batch_size,
+            "input_token_num": args.input_token_num,
+            "output_token_num": args.output_token_num,
+            "cpu_offload": args.cpu_offload,
+            "beam_width": args.beam_width,
+            "warmup": args.warmup,
+            "profile_expert_executor": True,
+            "sync_timing": True,
+        },
+        "generation": generation_results,
+        "expert_executor_timing": [
+            {k: (round(v, 6) if isinstance(v, float) else v) for k, v in row.items()}
+            for row in expert_timing
+        ],
+        "runtime_summary": runtime_summary,
+        "runtime_latency_estimates": {
+            "expert_cpu_avg_ms": latency_estimates["cpu_avg_ms"],
+            "expert_gpu_avg_ms": latency_estimates["gpu_avg_ms"],
+            "expert_copy_avg_ms": latency_estimates["copy_avg_ms"],
+        },
+        "expert_cpu": expert_cpu_list,
+        "expert_gpu": expert_gpu_list,
+        "expert_weight_copy": {
+            "trials_ms": [round(copy_ms, 4)],
+            "avg_ms": round(copy_ms, 4),
+            "median_ms": round(copy_ms, 4),
+            "p95_ms": round(copy_ms, 4),
+        },
+    }
 
-    Args:
-        model: mDeepSeek 实例
-        n_repeat: 重复测量次数
+    if latency_estimates["fallback_notes"]:
+        data["notes"] = "; ".join(latency_estimates["fallback_notes"])
 
-    Returns:
-        list[float]: 每次测量的搬运时间(秒)
-    """
-    expert_placeholder = copy.deepcopy(
-        model.model.layers[1].mlp.experts[0]
-    ).to(model.dev)
-
-    src_expert = model.model.layers[1].mlp.experts[2]
-    src_expert.to("cpu")
-    for name in WEIGHT_NAMES:
-        w = getattr(src_expert, name)
-        w.weight.data = w.weight.data.pin_memory()
-
-    results = []
-    for i in range(n_warmup + n_repeat):
-        torch.cuda.synchronize()
-        tick = time.time()
-        for name in WEIGHT_NAMES:
-            dst = getattr(expert_placeholder, name).weight.data
-            src = getattr(src_expert, name).weight.data
-            dst.copy_(src, non_blocking=True)
-        torch.cuda.synchronize()
-        if i >= n_warmup:
-            results.append(time.time() - tick)
-
-    return results
-
-
-def pin_expert_weights(expert):
-    for param in expert.parameters():
-        param.data = param.data.pin_memory()
-    for buffer in expert.buffers():
-        buffer.data = buffer.data.pin_memory()
-
-
-def bench_expert_manager_weight_copy(model, n_repeat=30, n_warmup=5):
-    """测量 placeholder manager 的真实 expert 权重加载路径。"""
-    src_expert = model.model.layers[1].mlp.experts[2]
-    src_expert.to("cpu")
-    pin_expert_weights(src_expert)
-
-    manager = ExpertPlaceholderManager(
-        template_expert=model.model.layers[1].mlp.experts[0],
-        device=model.dev,
-        num_placeholders=1,
-    )
-    placeholder = manager.acquire_free_placeholder(1, 2)
-
-    results = []
-    for i in range(n_warmup + n_repeat):
-        torch.cuda.synchronize()
-        tick = time.time()
-        manager.load_weights(placeholder, src_expert)
-        torch.cuda.synchronize()
-        if i >= n_warmup:
-            results.append(time.time() - tick)
-
-    return results
+    return data
 
 
-def bench_attention(model, token_counts=None, use_cache=False, n_repeat=5):
-    """测量 attention 计算时间（有无 KV cache）
-
-    Args:
-        model: mDeepSeek 实例
-        token_counts: 要测量的 token 数量列表
-        use_cache: 是否使用 KV cache（True=decode 模式 1 token, False=prefill 全量）
-        n_repeat: 重复测量次数
-
-    Returns:
-        list[(token_count, avg_time_ms)]: 每个 token 数量对应的平均计算时间
-    """
-    if token_counts is None:
-        token_counts = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-    hidden_dim = model.config.hidden_size
-
-    layer = model.model.layers[1]
-    rotary_emb = DeepseekV2RotaryEmbedding(config=model.config, device=model.dev)
-
-    results = []
-    for tc in token_counts:
-        if use_cache:
-            seq_len = 1
-            past_len = tc - 1
-            cache = transformers.cache_utils.DynamicCache()
-            fake_k = torch.randn(
-                1, model.config.num_attention_heads,
-                past_len,
-                model.config.qk_nope_head_dim + model.config.qk_rope_head_dim,
-                dtype=model.dtype, device=model.dev
-            )
-            fake_v = torch.randn(
-                1, model.config.num_attention_heads,
-                past_len,
-                model.config.v_head_dim,
-                dtype=model.dtype, device=model.dev
-            )
-            for li in range(model.n_layer):
-                cache.update(fake_k, fake_v, layer_idx=li)
-            cache_position = torch.arange(past_len, past_len + seq_len, device=model.dev)
-        else:
-            seq_len = tc
-            cache = transformers.cache_utils.DynamicCache()
-            cache_position = torch.arange(seq_len, device=model.dev)
-
-        inps = torch.randn(1, seq_len, hidden_dim, dtype=model.dtype, device=model.dev)
-        position_ids = torch.arange(seq_len, device=model.dev).unsqueeze(0)
-        attention_mask = torch.ones(1, seq_len + (tc - 1 if use_cache else 0),
-                                    dtype=torch.long, device=model.dev)
-        position_embeddings = rotary_emb(inps, position_ids)
-
-        causal_mask = create_causal_mask(
-            config=model.config,
-            input_embeds=inps,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=cache,
-            position_ids=position_ids,
-        )
-
-        _ = layer.self_attn(
-            hidden_states=inps,
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-            past_key_value=cache,
-            use_cache=True,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-
-        measurements = []
-        for _ in range(n_repeat):
-            torch.cuda.synchronize()
-            tick = time.time()
-            _ = layer.self_attn(
-                hidden_states=inps,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_value=cache,
-                use_cache=True,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
-            torch.cuda.synchronize()
-            measurements.append(time.time() - tick)
-        avg_ms = np.mean(measurements) * 1000
-        results.append((tc, avg_ms))
-
-    return results
-
-
-def save_benchmark_results(model_path, cpu_results, gpu_results, copy_results,
-                           manager_copy_results, attn_prefill, attn_decode, output_dir=None):
-    """将所有 benchmark 结果保存为 JSON 文件
-
-    Args:
-        model_path: 模型路径，用于提取模型名作为文件名
-        cpu_results: bench_expert_cpu 的返回值
-        gpu_results: bench_expert_gpu 的返回值
-        copy_results: bench_expert_weight_copy 的返回值
-        attn_prefill: bench_attention(use_cache=False) 的返回值
-        attn_decode: bench_attention(use_cache=True) 的返回值
-        output_dir: 输出目录，默认为脚本所在目录
-    """
-    model_name = os.path.basename(model_path.rstrip('/')).lower()
+def save_benchmark_results(data, output_dir=None):
+    model_name = data["model_name"]
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(__file__))
 
-    data = {
-        "model_name": model_name,
-        "timestamp": datetime.now().isoformat(),
-        "expert_cpu": [
-            {"token_count": tc, "avg_time_ms": round(t, 4)}
-            for tc, t in cpu_results
-        ],
-        "expert_gpu": [
-            {"token_count": tc, "avg_time_ms": round(t, 4)}
-            for tc, t in gpu_results
-        ],
-        "expert_weight_copy": {
-            **summarize_measurements(copy_results),
-        },
-        "expert_manager_weight_copy": {
-            **summarize_measurements(manager_copy_results),
-        },
-        "attention_prefill": [
-            {"token_count": tc, "avg_time_ms": round(t, 4)}
-            for tc, t in attn_prefill
-        ],
-        "attention_decode": [
-            {"past_length": tc, "avg_time_ms": round(t, 4)}
-            for tc, t in attn_decode
-        ],
-    }
-
     filename = f"micro_{model_name}.json"
     filepath = os.path.join(output_dir, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     print(f"\nBenchmark results saved to: {filepath}")
     return filepath
 
 
+def print_benchmark_report(generation_results, expert_timing, runtime_summary,
+                           latency_estimates):
+    print("=" * 60)
+    print("Runtime Generation Benchmark")
+    print("=" * 60)
+
+    for i, gen in enumerate(generation_results):
+        print(f"\n  Repeat {i + 1}:")
+        print(f"    prefill_time   = {gen['prefill_time_s']:.4f}s")
+        print(f"    decode_time    = {gen['decode_time_s']:.4f}s")
+        print(f"    hit_rate        = {gen['hit_rate']:.4f}")
+        print(f"    prefill_throughput = {gen['prefill_throughput_tokens_per_s']:.2f} tokens/s")
+        print(f"    decode_throughput  = {gen['decode_throughput_tokens_per_s']:.2f} tokens/s")
+
+    print()
+    print("-" * 60)
+    print("Expert Executor Timing Summary")
+    print("-" * 60)
+    if not expert_timing:
+        print("  (no timing data)")
+    else:
+        print(
+            f"  {'layer':>5} {'calls':>6} {'wall':>10} {'gpu':>10} "
+            f"{'cpu':>10} {'preload':>10}"
+        )
+        for row in expert_timing:
+            print(
+                f"  {int(row['layer']):>5} {int(row['calls']):>6} "
+                f"{row['wall']:>10.6f} {row['gpu']:>10.6f} "
+                f"{row['cpu']:>10.6f} {row['preload']:>10.6f}"
+            )
+
+    print()
+    print("-" * 60)
+    print("Hit Source Summary")
+    print("-" * 60)
+    hs = runtime_summary.get("hit_source", {})
+    print(f"  static_gpu_hit   = {hs.get('static_gpu_hit_count', 0)} (tokens={hs.get('static_gpu_hit_tokens', 0)})")
+    print(f"  placeholder_hit  = {hs.get('placeholder_hit_count', 0)} (tokens={hs.get('placeholder_hit_tokens', 0)})")
+    print(f"  ondemand_load    = {hs.get('ondemand_load_count', 0)} (tokens={hs.get('ondemand_load_tokens', 0)})")
+    print(f"  preload_hit      = {hs.get('preload_hit_count', 0)}")
+    print(f"  total_gpu_hits   = {hs.get('total_gpu_hits', 0)}")
+    print(f"  placeholder_hit_rate = {hs.get('placeholder_hit_rate', 0):.4f}")
+
+    print()
+    print("-" * 60)
+    print("Placeholder Summary")
+    print("-" * 60)
+    ps = runtime_summary.get("placeholder", {})
+    print(f"  resident       = {ps.get('placeholder_resident', 0)}")
+    print(f"  free           = {ps.get('free_placeholders', 0)}")
+    print(f"  loading        = {ps.get('loading', 0)}")
+    print(f"  eviction_count = {ps.get('eviction_count', 0)}")
+
+    sched = runtime_summary.get("schedule", None)
+    if sched is not None:
+        print()
+        print("-" * 60)
+        print("Schedule Summary")
+        print("-" * 60)
+        print(f"  total_calls = {sched.get('total_calls', 0)}")
+
+    print()
+    print("-" * 60)
+    print("Latency Estimates (for _load_latency_tables compatibility)")
+    print("-" * 60)
+    print(f"  expert_gpu_avg_ms  = {latency_estimates['gpu_avg_ms']:.4f}")
+    print(f"  expert_cpu_avg_ms  = {latency_estimates['cpu_avg_ms']:.4f}")
+    print(f"  expert_copy_avg_ms = {latency_estimates['copy_avg_ms']:.4f}")
+    if latency_estimates["fallback_notes"]:
+        print(f"  notes: {'; '.join(latency_estimates['fallback_notes'])}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    parser = argparse.ArgumentParser(
+        description="Runtime microbenchmark using real mDeepSeek inference operators."
+    )
     parser.add_argument("--model", type=str, required=True, help="Path to DeepSeek model.")
-    parser.add_argument("--cpu-offload", type=int, default=0, choices=[0, 1, 2])
+    parser.add_argument("--cpu-offload", type=int, default=1, choices=[0, 1, 2])
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--beam-width", type=int, default=1)
-    parser.add_argument("--copy-repeat", type=int, default=30)
-    parser.add_argument("--copy-warmup", type=int, default=5)
+    parser.add_argument("--input-token-num", type=int, default=64,
+                        help="Max input tokens for tokenization.")
+    parser.add_argument("--output-token-num", type=int, default=20,
+                        help="Number of tokens to generate.")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="Number of warmup generate runs before measurement.")
+    parser.add_argument("--input", type=str, default="Please tell me a joke.",
+                        help="Input prompt text.")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Path to ShareGPT JSON. Overrides --input.")
 
     args = parser.parse_args()
+
+    args.profile_expert_executor = True
+    args.sync_timing = True
+    args.record_expert_schedule = True
+    args.expert_schedule_log = None
+    args.record_hot_experts = False
+
     model = mDeepSeek(args)
 
-    print("=" * 60)
-    print("1. Expert CPU computation time (token_count, time_ms)")
-    print("=" * 60)
-    cpu_results = bench_expert_cpu(model, token_counts=[1, 2, 4, 8, 16, 32, 64, 128])
-    for tc, t in cpu_results:
-        print(f"  tokens={tc:4d}  cpu_time={t:.4f}ms")
+    if args.dataset:
+        prompts = load_prompts_from_dataset(args.dataset, args.batch_size)
+    elif args.batch_size > 1:
+        prompts = [args.input] * args.batch_size
+    else:
+        prompts = args.input
 
-    print()
-    print("=" * 60)
-    print("2. Expert GPU computation time (token_count, time_ms)")
-    print("=" * 60)
-    gpu_results = bench_expert_gpu(model, token_counts=[1, 2, 4, 8, 16, 32, 64, 128])
-    for tc, t in gpu_results:
-        print(f"  tokens={tc:4d}  gpu_time={t:.4f}ms")
-
-    print()
-    print("=" * 60)
-    print("3. Expert weight copy CPU->GPU time")
-    print("=" * 60)
-    copy_results = bench_expert_weight_copy(model, n_repeat=args.copy_repeat, n_warmup=args.copy_warmup)
-    copy_summary = summarize_measurements(copy_results)
-    for i, t in enumerate(copy_results):
-        print(f"  trial={i+1}  copy_time={t*1000:.4f}ms")
-    print(
-        f"  avg={copy_summary['avg_ms']:.4f}ms "
-        f"median={copy_summary['median_ms']:.4f}ms "
-        f"p95={copy_summary['p95_ms']:.4f}ms"
+    generation_results, expert_timing, runtime_summary = bench_runtime_generate(
+        model=model,
+        prompts=prompts,
+        input_token=args.input_token_num,
+        output_token=args.output_token_num,
+        warmup=args.warmup,
     )
 
-    print()
-    print("=" * 60)
-    print("4. Expert manager weight copy CPU->GPU time")
-    print("=" * 60)
-    manager_copy_results = bench_expert_manager_weight_copy(model, n_repeat=args.copy_repeat, n_warmup=args.copy_warmup)
-    manager_copy_summary = summarize_measurements(manager_copy_results)
-    for i, t in enumerate(manager_copy_results):
-        print(f"  trial={i+1}  manager_copy_time={t*1000:.4f}ms")
-    print(
-        f"  avg={manager_copy_summary['avg_ms']:.4f}ms "
-        f"median={manager_copy_summary['median_ms']:.4f}ms "
-        f"p95={manager_copy_summary['p95_ms']:.4f}ms"
-    )
+    latency_estimates = estimate_latency_fields(expert_timing, model)
 
-    print()
-    print("=" * 60)
-    print("5. Attention computation time (token_count, time_ms)")
-    print("-" * 60)
-    print("  Without KV cache (prefill):")
-    attn_nocache = bench_attention(model, token_counts=[1, 8, 32, 64, 128, 256], use_cache=False)
-    for tc, t in attn_nocache:
-        print(f"    tokens={tc:4d}  attn_time={t:.4f}ms")
+    print_benchmark_report(generation_results, expert_timing, runtime_summary,
+                           latency_estimates)
 
-    print("  With KV cache (decode, 1 token):")
-    attn_cache = bench_attention(model, token_counts=[1, 8, 32, 64, 128, 256], use_cache=True)
-    for tc, t in attn_cache:
-        print(f"    past_len={tc:4d}  attn_time={t:.4f}ms")
-
-    save_benchmark_results(
-        model_path=args.model,
-        cpu_results=cpu_results,
-        gpu_results=gpu_results,
-        copy_results=copy_results,
-        manager_copy_results=manager_copy_results,
-        attn_prefill=attn_nocache,
-        attn_decode=attn_cache,
-    )
+    data = build_benchmark_json(args, generation_results, expert_timing,
+                                runtime_summary, latency_estimates)
+    save_benchmark_results(data)

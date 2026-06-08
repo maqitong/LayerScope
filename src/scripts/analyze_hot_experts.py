@@ -4,7 +4,7 @@ import os
 import random
 from collections import Counter
 
-from model.deepseek import mDeepSeek
+from models.deepseek import mDeepSeek
 
 
 def load_sharegpt_prompts(dataset_path):
