@@ -8,8 +8,8 @@ PYTHONPATH="$PWD" python ./scripts/infer_deepseek.py \
     --beam-width 1 \
     --cpu-offload 1 \
     --warmup 0 \
-    --input-token-num 256 \
-    --output-token-num 128 \
+    --input-token-num 128 \
+    --output-token-num 100 \
     --expert-schedule-log logs/schedule_${TIMESTAMP}.jsonl \
     --record-expert-schedule \
     --hit-source-log logs/hit_source_${TIMESTAMP}.jsonl #> logs/infer_${TIMESTAMP}.log 2>&1

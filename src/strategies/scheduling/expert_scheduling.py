@@ -535,7 +535,7 @@ class PDScopeScheduler(ExpertScheduler):
         gpu_keys = {(d.key.layer, d.key.expert_id) for d in current_resident + ondemand}
         gpu = [d for d in current if (d.key.layer, d.key.expert_id) in gpu_keys]
         cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
-        preload = self._select_preload(global_queue, t_gpu, t_cpu, placement, latency)
+        preload = self._select_preload(combined, t_gpu, t_cpu, placement, latency)
 
         return ExpertSchedule(cpu=cpu, gpu=gpu, preload=preload, evict=[], reason="prefill")
 
@@ -581,8 +581,8 @@ class PDScopeScheduler(ExpertScheduler):
             if placement.is_on_gpu(d.key.layer, d.key.expert_id)
         )
 
-        cur_below = len(current_resident) <= n_g_rho # 当前层驻留专家数不足以满足理想 GPU 专家数
-        next_below = next_resident_count <= n_g_rho # 下一层驻留专家数不足以满足理想 GPU 专家数
+        cur_below = len(current_resident) < n_g_rho
+        next_below = next_resident_count < n_g_rho
 
         current_ids = [d.key.expert_id for d in current]
         current_resident_ids = [d.key.expert_id for d in current_resident]

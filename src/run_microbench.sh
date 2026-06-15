@@ -1,5 +1,5 @@
 #!/bin/bash
-python ./benchmark/microbench.py \
+python ./benchmark/microbench_runtime.py \
     --model /mnt/g/Models/DeepSeek-v2-lite-chat \
     --cpu-offload 1 \
     --batch-size 1 \
