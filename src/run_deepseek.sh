@@ -8,11 +8,12 @@ PYTHONPATH="$PWD" python ./scripts/infer_deepseek.py \
     --beam-width 1 \
     --cpu-offload 1 \
     --warmup 0 \
-    --input-token-num 256 \
+    --input-token-num 1024 \
     --output-token-num 128 \
     --expert-schedule-log logs/schedule_${TIMESTAMP}.jsonl \
-    --record-expert-schedule \
+    --debug-runtime-state \
     --hit-source-log logs/hit_source_${TIMESTAMP}.jsonl #> logs/infer_${TIMESTAMP}.log 2>&1
+    # --record-expert-schedule \
     # --debug-runtime-state \
     # --profile-expert-executor \
     ## 开启后保留预热阶段的占位专家缓存

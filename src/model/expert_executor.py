@@ -27,6 +27,9 @@ class ExpertExecutionManager:
         self.preload_request_count = 0
         self.preload_success_count = 0
         self.preload_skip_count = 0
+        self.preload_skip_already_gpu_count = 0
+        self.preload_skip_loading_count = 0
+        self.preload_skip_no_slot_count = 0
         self.preload_hit_count = 0
         self.static_gpu_hit_count = 0
         self.static_gpu_hit_tokens = 0
@@ -216,7 +219,6 @@ class ExpertExecutionManager:
                     current_state = placeholder(current_state)
                 finally:
                     self.placeholder_manager.unprotect_expert(context.layer, expert_id)
-                self.placeholder_manager.release_by_layer(context.layer)
             else:
                 self.ondemand_load_count += 1
                 self.ondemand_load_tokens += n_tokens
@@ -233,6 +235,7 @@ class ExpertExecutionManager:
 
             current_state = current_state * assignment.routing_weights
             result.index_add_(0, token_indices, current_state.to(result.dtype))
+        self.placeholder_manager.release_by_layer(context.layer)
         return result
 
     def execute_cpu_experts(self, context: ExpertLayerContext, expert_ids: List[int]) -> torch.Tensor:
@@ -270,21 +273,23 @@ class ExpertExecutionManager:
         for layer, expert_ids in by_layer.items():
             if layer >= len(self.model.layers):
                 continue
-            tick = time.time()
+            # tick = time.time()
             loaded = 0
             for expert_id in expert_ids:
                 self.preload_request_count += 1
                 if self.is_expert_in_gpu(layer, expert_id) or self.placeholder_manager.is_on_gpu(layer, expert_id):
-                    self.preload_skip_count += 1
+                    self.preload_skip_already_gpu_count += 1
                     continue
                 if self.placeholder_manager.is_loading(layer, expert_id):
                     self.preload_skip_count += 1
+                    self.preload_skip_loading_count += 1
                     continue
                 self.placeholder_manager.mark_loading(layer, expert_id)
                 try:
                     placeholder = self.placeholder_manager.acquire_free_placeholder(layer, expert_id)
                     if placeholder is None:
                         self.preload_skip_count += 1
+                        self.preload_skip_no_slot_count += 1
                         continue
                     self.placeholder_manager.load_weights(placeholder, self.get_cpu_expert(layer, expert_id))
                     self._record_preload_event(layer, expert_id)
@@ -292,7 +297,7 @@ class ExpertExecutionManager:
                     self.preload_success_count += 1
                 finally:
                     self.placeholder_manager.unmark_loading(layer, expert_id)
-            elapsed = time.time() - tick
+            # elapsed = time.time() - tick
             # # replaced by func _add_timing to avoid excessive logging 
             # if loaded > 0:
             #     print(f"  Preload layer {layer}: {loaded} experts loaded in {elapsed*1000:.2f}ms")

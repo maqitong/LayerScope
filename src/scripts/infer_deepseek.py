@@ -56,6 +56,7 @@ def print_executor_hit_sources(model, hit_source_log=None):
     print(f"[hit-source] preload_hit/placeholder={preload_of_placeholder_rate:.4f}")
     print(f"[hit-source] preload_hit/preload_success={preload_of_success_rate:.4f}")
     print(f"[hit-source] preload_hit/preload_request={preload_of_request_rate:.4f}")
+    print(f"[hit-source] preload_skip={ex.preload_skip_count} (loading={ex.preload_skip_loading_count} no_slot={ex.preload_skip_no_slot_count} already_gpu={ex.preload_skip_already_gpu_count})")
 
     if hit_source_log:
         record = {
@@ -70,6 +71,9 @@ def print_executor_hit_sources(model, hit_source_log=None):
             "preload_request_count": ex.preload_request_count,
             "preload_success_count": ex.preload_success_count,
             "preload_skip_count": ex.preload_skip_count,
+            "preload_skip_already_gpu_count": ex.preload_skip_already_gpu_count,
+            "preload_skip_loading_count": ex.preload_skip_loading_count,
+            "preload_skip_no_slot_count": ex.preload_skip_no_slot_count,
             "total_gpu_hits": total_gpu_hits,
             "total_gpu_tokens": total_gpu_tokens,
             "placeholder_hit_rate": placeholder_hit_rate,

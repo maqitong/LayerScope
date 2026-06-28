@@ -54,7 +54,7 @@ class mDeepSeek:
         self.placeholder_manager = ExpertPlaceholderManager(
             template_expert=template_expert,
             device=self.dev,
-            num_placeholders= 2 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
+            num_placeholders= 4 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
             eviction_strategy=FIFOEvictionStrategy(),
             # eviction_strategy=LRUEvictionStrategy(),
         )
@@ -487,6 +487,9 @@ class mDeepSeek:
             self.expert_executor.preload_request_count = 0
             self.expert_executor.preload_success_count = 0
             self.expert_executor.preload_skip_count = 0
+            self.expert_executor.preload_skip_already_gpu_count = 0
+            self.expert_executor.preload_skip_loading_count = 0
+            self.expert_executor.preload_skip_no_slot_count = 0
             self.expert_executor.preload_hit_count = 0
             self.expert_executor.static_gpu_hit_count = 0
             self.expert_executor.static_gpu_hit_tokens = 0
@@ -662,6 +665,8 @@ class mDeepSeek:
                 hidden_dim=hidden_dim,
                 assignments=build_assignments(expert_assignments),
             )
+
+            # 执行器 进行专家前向推理，返回专家输出
             inps_after_experts = self.expert_executor.execute(schedule, context)
             
             total_expert_output = shared_output.view(-1, hidden_dim) + inps_after_experts
@@ -673,55 +678,3 @@ class mDeepSeek:
         self.present_key_value = present_key_value
         return lm_logis
 
-    def _prefetch_next_layer_experts(self, i_layer, prefetch_experts):
-        """预取下一层专家权重到 GPU placeholder"""
-        next_layer = i_layer + 1
-        if next_layer >= self.n_layer:
-            return
-        next_experts = self.model.layers[next_layer].mlp.experts
-        tick = time.time()
-        loaded = 0
-        for expert_id in prefetch_experts:
-            if self.is_expert_in_gpu(next_layer, expert_id):
-                continue
-            placeholder = self.placeholder_manager.acquire_placeholder(next_layer, expert_id)
-            if placeholder is None:
-                break
-            self.placeholder_manager.load_weights(placeholder, next_experts[expert_id])
-            loaded += 1
-        elapsed = time.time() - tick
-        if loaded > 0:
-            print(f"  Prefetch layer {next_layer}: {loaded} experts loaded in {elapsed*1000:.2f}ms")
-
-    def run_expert_at_cpu(self, i_layer, i_expert, inps):
-        return self.model.layers[i_layer].mlp.experts[i_expert](inps)
-    
-    def _execute_gpu_experts(self, i_layer, experts, gpu_experts, expert_assignments, inps_flat, hidden_dim):
-        """执行 GPU 专家，返回结果张量（在 GPU 上）"""
-        result = torch.zeros_like(inps_flat, device=self.dev)
-        for i_expert in gpu_experts:
-            top_2, routing_weight_subset = expert_assignments[i_expert]
-            current_state = inps_flat[None, top_2.tolist()].reshape(-1, hidden_dim)
-            
-            if self.is_expert_in_gpu(i_layer, i_expert):
-                current_state = experts[i_expert](current_state)
-            else:
-                placeholder = self.placeholder_manager.acquire_placeholder(i_layer, i_expert)
-                self.placeholder_manager.load_weights(placeholder, experts[i_expert])
-                current_state = placeholder(current_state)
-                self.placeholder_manager.release_by_layer(i_layer)
-            
-            current_state = current_state * routing_weight_subset
-            result.index_add_(0, top_2.to(self.dev, non_blocking=True), current_state.to(result.dtype))
-        return result
-    
-    def _execute_cpu_experts(self, i_layer, experts, cpu_experts, expert_assignments, inps_flat, hidden_dim):
-        """执行 CPU 专家，返回结果张量（在 CPU 上，之后会传回 GPU）"""
-        result = torch.zeros_like(inps_flat, device='cpu')
-        for i_expert in cpu_experts:
-            top_2, routing_weight_subset = expert_assignments[i_expert]
-            current_state = inps_flat[None, top_2.tolist()].reshape(-1, hidden_dim)
-            current_state = self.run_expert_at_cpu(i_layer, i_expert, current_state.to("cpu"))
-            current_state = current_state * routing_weight_subset.to("cpu")
-            result.index_add_(0, top_2.to('cpu', non_blocking=True), current_state.to(result.dtype))
-        return result
