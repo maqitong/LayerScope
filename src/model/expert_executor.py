@@ -19,6 +19,7 @@ class ExpertExecutionManager:
         self.cpu_experts = cpu_experts if cpu_experts is not None else {}
         self.compute_stream = torch.cuda.Stream(device=self.device) if self._is_cuda_device() else None
         self.preload_stream = torch.cuda.Stream(device=self.device) if self._is_cuda_device() else None
+        self._pool = ThreadPoolExecutor(max_workers=3)
         self._timing_lock = threading.Lock()
         self._timing_stats = defaultdict(lambda: defaultdict(float))
         self._preload_event_lock = threading.Lock()
@@ -39,20 +40,20 @@ class ExpertExecutionManager:
         cpu_result = None
         wall_tick = time.perf_counter()
         caller_stream = torch.cuda.current_stream(self.device) if self._is_cuda_device() else None
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {}
-            if schedule.gpu_expert_ids:
-                futures[executor.submit(self._timed_call, context.layer, "gpu", self.execute_gpu_experts, context, schedule.gpu_expert_ids, caller_stream)] = "gpu"
-            if schedule.cpu_expert_ids:
-                futures[executor.submit(self._timed_call, context.layer, "cpu", self.execute_cpu_experts, context, schedule.cpu_expert_ids)] = "cpu"
-            if schedule.preload:
-                futures[executor.submit(self._timed_call, context.layer, "preload", self.preload_experts, schedule.preload)] = "preload"
+        pool = self._ensure_pool()
+        futures = {}
+        if schedule.gpu_expert_ids:
+            futures[pool.submit(self._timed_call, context.layer, "gpu", self.execute_gpu_experts, context, schedule.gpu_expert_ids, caller_stream)] = "gpu"
+        if schedule.cpu_expert_ids:
+            futures[pool.submit(self._timed_call, context.layer, "cpu", self.execute_cpu_experts, context, schedule.cpu_expert_ids)] = "cpu"
+        if schedule.preload:
+            futures[pool.submit(self._timed_call, context.layer, "preload", self.preload_experts, schedule.preload)] = "preload"
 
-            results = {}
-            for future in list(futures.keys()):
-                results[futures[future]] = future.result()
-            gpu_result = results.get("gpu")
-            cpu_result = results.get("cpu")
+        results = {}
+        for future in list(futures.keys()):
+            results[futures[future]] = future.result()
+        gpu_result = results.get("gpu")
+        cpu_result = results.get("cpu")
 
         if caller_stream is not None and gpu_result is not None:
             caller_stream.wait_stream(self.compute_stream)
@@ -72,6 +73,16 @@ class ExpertExecutionManager:
             self._timing_stats.clear()
         with self._preload_event_lock:
             self._preload_events.clear()
+
+    def _ensure_pool(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=3)
+        return self._pool
+
+    def shutdown(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
     def timing_summary(self) -> List[Dict[str, float]]:
         with self._timing_lock:

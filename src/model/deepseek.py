@@ -4,7 +4,6 @@ import os
 import time
 from collections import Counter
 from typing import List, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -294,8 +293,8 @@ class mDeepSeek:
         
         # 70% of total memory for safety margin
         #torch.cuda.memory_allocated：PyTorch 官方提供的显存统计 API，专门统计已使用的显存
-        # free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
-        free_mem = total_mem * 0.20 - torch.cuda.memory_reserved(self.dev)
+        free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
+        # free_mem = total_mem * 0.20 - torch.cuda.memory_reserved(self.dev)
         
         print(f"Total GPU memory: {total_mem / 1024 / 1024:.2f} MB, Free GPU memory: {free_mem / 1024 / 1024:.2f} MB")
         return int(free_mem // (n_param * 2))
@@ -463,6 +462,9 @@ class mDeepSeek:
         print(f"Input: {text}")
         print(f"Output: {decoded_outputs[0]}")
 
+        if hasattr(self, "expert_executor"):
+            self.expert_executor.shutdown()
+
         return (
             prefill_time,
             decode_time,
@@ -611,17 +613,10 @@ class mDeepSeek:
             if self.record_hot_experts:
                 self.record_hot_expert_selection(i_layer, selected_experts)
 
-            # 与当前层专家执行并行：预测下一层活跃专家
-            predict_future = None
-            if i_layer + 1 < self.n_layer:
-                with ThreadPoolExecutor(max_workers=1) as pred_executor:
-                    predict_future = pred_executor.submit(
-                        self.expert_predictor.predict, inps, self.model, i_layer, 1
-                    )
-
-            # 收集预测结果（在专家执行完成后应已就绪）
-            if predict_future is not None:
-                pred_result = predict_future.result()
+            # 预测下一层活跃专家：仅当策略会消费 future_demands 进行预加载时才跑，
+            # 避免 GPUOnly/Fiddler 白跑一次下一层 gate 前向 + .cpu().tolist() 同步
+            if isinstance(self.expert_strategy, PrefetchHybridStrategy) and i_layer + 1 < self.n_layer:
+                pred_result = self.expert_predictor.predict(inps, self.model, i_layer, 1)
                 self.predicted_next_demands = pred_result or []
             else:
                 self.predicted_next_demands = []
