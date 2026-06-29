@@ -129,7 +129,10 @@ def build_future_demands(
     predicted_weights=None,
     source: str = "predicted",
 ) -> List[ExpertDemand]:
-    """从预测的专家张量生成未来专家需求"""
+    """从预测的专家张量生成未来专家需求
+
+    所有张量操作在 CPU 上完成，仅在入口处做一次 GPU→CPU 同步。
+    """
     if predicted_experts is None:
         return []
     if isinstance(predicted_experts, list):
@@ -139,22 +142,26 @@ def build_future_demands(
     if flat_experts.numel() == 0:
         return []
 
+    if predicted_weights is not None:
+        flat_weights = predicted_weights.reshape(-1).to(dtype=torch.float32)
+        combined = torch.stack([flat_experts.float(), flat_weights])
+        combined_cpu = combined.detach().cpu()
+        flat_experts_cpu = combined_cpu[0].long()
+        flat_weights_cpu = combined_cpu[1]
+    else:
+        flat_experts_cpu = flat_experts.detach().cpu()
+
     unique_experts, inverse, counts = torch.unique(
-        flat_experts,
+        flat_experts_cpu,
         sorted=True,
         return_inverse=True,
         return_counts=True,
     )
     if predicted_weights is not None:
-        flat_weights = predicted_weights.reshape(-1).to(device=flat_experts.device, dtype=torch.float32)
-        scores = torch.zeros(unique_experts.shape[0], dtype=torch.float32, device=flat_experts.device)
-        scores.index_add_(0, inverse, flat_weights)
+        scores = torch.zeros(unique_experts.shape[0], dtype=torch.float32, device="cpu")
+        scores.index_add_(0, inverse, flat_weights_cpu)
     else:
         scores = counts.to(dtype=torch.float32)
-
-    unique_cpu = unique_experts.detach().cpu().tolist()
-    counts_cpu = counts.detach().cpu().tolist()
-    scores_cpu = scores.detach().cpu().tolist()
 
     return [
         ExpertDemand(
@@ -163,7 +170,7 @@ def build_future_demands(
             score=float(score),
             source=source,
         )
-        for expert_id, token_count, score in zip(unique_cpu, counts_cpu, scores_cpu)
+        for expert_id, token_count, score in zip(unique_experts.tolist(), counts.tolist(), scores.tolist())
     ]
 
 

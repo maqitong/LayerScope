@@ -41,17 +41,20 @@ def print_runtime_state(model, label):
 
 def print_executor_hit_sources(model, hit_source_log=None):
     ex = model.expert_executor
-    total_gpu_hits = ex.static_gpu_hit_count + ex.placeholder_hit_count + ex.ondemand_load_count
-    total_gpu_tokens = ex.static_gpu_hit_tokens + ex.placeholder_hit_tokens + ex.ondemand_load_tokens
-    placeholder_hit_rate = ex.placeholder_hit_count / max(total_gpu_hits, 1)
-    preload_of_placeholder_rate = ex.preload_hit_count / max(ex.placeholder_hit_count, 1)
+    total_gpu_count = ex.gpu_experts_static_hit_count + ex.gpu_experts_placeholder_hit_count + ex.gpu_experts_ondemand_count
+    total_gpu_tokens = ex.gpu_experts_static_hit_tokens + ex.gpu_experts_placeholder_hit_tokens + ex.gpu_experts_ondemand_tokens
+    placeholder_hit_rate = ex.gpu_experts_placeholder_hit_count / max(total_gpu_count, 1)
+    preload_of_placeholder_rate = ex.preload_hit_count / max(ex.gpu_experts_placeholder_hit_count, 1)
     preload_of_success_rate = ex.preload_hit_count / max(ex.preload_success_count, 1)
     preload_of_request_rate = ex.preload_hit_count / max(ex.preload_request_count, 1)
-    print(f"[hit-source] static_gpu_hit={ex.static_gpu_hit_count} (tokens={ex.static_gpu_hit_tokens})")
-    print(f"[hit-source] placeholder_hit={ex.placeholder_hit_count} (tokens={ex.placeholder_hit_tokens})")
-    print(f"[hit-source] ondemand_load={ex.ondemand_load_count} (tokens={ex.ondemand_load_tokens})")
+    print(f"[hit-source] gpu_experts_static_hit={ex.gpu_experts_static_hit_count} (tokens={ex.gpu_experts_static_hit_tokens})")
+    print(f"[hit-source] gpu_experts_placeholder_hit={ex.gpu_experts_placeholder_hit_count} (tokens={ex.gpu_experts_placeholder_hit_tokens})")
+    print(f"[hit-source] gpu_experts_ondemand={ex.gpu_experts_ondemand_count} (tokens={ex.gpu_experts_ondemand_tokens})")
     print(f"[hit-source] preload_hit={ex.preload_hit_count} (of placeholder hits)")
-    print(f"[hit-source] total_gpu_experts={total_gpu_hits} (tokens={total_gpu_tokens})")
+    print(f"[hit-source] total_gpu_count={total_gpu_count} (tokens={total_gpu_tokens})")
+    total_cpu_count = ex.cpu_experts_hit_count
+    total_cpu_tokens = ex.cpu_experts_hit_tokens
+    print(f"[hit-source] total_cpu_count={total_cpu_count} (tokens={total_cpu_tokens})")
     print(f"[hit-source] placeholder_hit_rate={placeholder_hit_rate:.4f} (placeholder / total_gpu)")
     print(f"[hit-source] preload_hit/placeholder={preload_of_placeholder_rate:.4f}")
     print(f"[hit-source] preload_hit/preload_success={preload_of_success_rate:.4f}")
@@ -61,12 +64,12 @@ def print_executor_hit_sources(model, hit_source_log=None):
     if hit_source_log:
         record = {
             "timestamp": datetime.datetime.now().isoformat(),
-            "static_gpu_hit_count": ex.static_gpu_hit_count,
-            "static_gpu_hit_tokens": ex.static_gpu_hit_tokens,
-            "placeholder_hit_count": ex.placeholder_hit_count,
-            "placeholder_hit_tokens": ex.placeholder_hit_tokens,
-            "ondemand_load_count": ex.ondemand_load_count,
-            "ondemand_load_tokens": ex.ondemand_load_tokens,
+            "gpu_experts_static_hit_count": ex.gpu_experts_static_hit_count,
+            "gpu_experts_static_hit_tokens": ex.gpu_experts_static_hit_tokens,
+            "gpu_experts_placeholder_hit_count": ex.gpu_experts_placeholder_hit_count,
+            "gpu_experts_placeholder_hit_tokens": ex.gpu_experts_placeholder_hit_tokens,
+            "gpu_experts_ondemand_count": ex.gpu_experts_ondemand_count,
+            "gpu_experts_ondemand_tokens": ex.gpu_experts_ondemand_tokens,
             "preload_hit_count": ex.preload_hit_count,
             "preload_request_count": ex.preload_request_count,
             "preload_success_count": ex.preload_success_count,
@@ -74,8 +77,10 @@ def print_executor_hit_sources(model, hit_source_log=None):
             "preload_skip_already_gpu_count": ex.preload_skip_already_gpu_count,
             "preload_skip_loading_count": ex.preload_skip_loading_count,
             "preload_skip_no_slot_count": ex.preload_skip_no_slot_count,
-            "total_gpu_hits": total_gpu_hits,
+            "total_gpu_count": total_gpu_count,
             "total_gpu_tokens": total_gpu_tokens,
+            "total_cpu_count": total_cpu_count,
+            "total_cpu_tokens": total_cpu_tokens,
             "placeholder_hit_rate": placeholder_hit_rate,
             "preload_of_placeholder_rate": preload_of_placeholder_rate,
             "preload_of_success_rate": preload_of_success_rate,
@@ -96,9 +101,6 @@ def print_expert_timing(model):
     for line in lines:
         print(line)
 
-def print_placeholder_hit_rate(model):
-    print(f"Placeholder resident hits: {model.placeholder_manager.placeholder_resident_hit_num}")
-    print(f"Static GPU resident hits: {model.placeholder_manager.static_gpu_resdient_hit_num}")
 
 
 
@@ -276,7 +278,6 @@ if __name__ == "__main__":
         print_runtime_state(model, "after-measure")
     if args.profile_expert_executor:
         print_expert_timing(model)
-        print_placeholder_hit_rate(model)
 
     print_executor_hit_sources(model, hit_source_log=args.hit_source_log)
 

@@ -38,9 +38,6 @@ class ExpertPlaceholderManager:
         self._lock = threading.Lock()
         self.eviction_count = 0
 
-        self.static_gpu_resdient_hit_num = 0
-        self.placeholder_resident_hit_num = 0
-
     @property
     def num_placeholders(self) -> int:
         return len(self._placeholders)
@@ -106,10 +103,10 @@ class ExpertPlaceholderManager:
         with torch.no_grad():
             for name, dst_param in dst.named_parameters():
                 src_param = src.get_parameter(name)
-                dst_param.copy_(src_param, non_blocking=True)
+                dst_param.copy_(src_param)
             for name, dst_buffer in dst.named_buffers():
                 src_buffer = src.get_buffer(name)
-                dst_buffer.copy_(src_buffer, non_blocking=True)
+                dst_buffer.copy_(src_buffer)
 
     def mark_static_gpu_resident(self, layer_id: int, expert_id: int):
         with self._lock:
@@ -137,13 +134,6 @@ class ExpertPlaceholderManager:
     def is_on_gpu(self, layer_id: int, expert_id: int) -> bool:
         with self._lock:
             key = (layer_id, expert_id)
-            # if key in self._reverse_map:
-            #     self.placeholder_resident_hit_num += 1
-            #     return True
-            # if key in self._static_gpu_resident:
-            #     self.static_gpu_resdient_hit_num += 1
-            #     return True
-            # return False
             return key in self._static_gpu_resident or key in self._reverse_map
 
     def is_static_gpu_resident(self, layer_id: int, expert_id: int) -> bool:

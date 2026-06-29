@@ -37,10 +37,26 @@ def _placement_summary(placement: Optional[PlacementSnapshot], current_demands: 
         return {}
     current_layer = current_demands[0].key.layer if current_demands else -1
     future_layer = future_demands[0].key.layer if future_demands else current_layer + 1
-    current_resident = [d.key.expert_id for d in (current_demands or [])
-                        if placement.is_on_gpu(d.key.layer, d.key.expert_id)]
-    future_resident = [d.key.expert_id for d in (future_demands or [])
-                       if placement.is_on_gpu(d.key.layer, d.key.expert_id)]
+
+    def _split_resident(demands: Optional[List[ExpertDemand]]) -> Tuple[List[int], List[int]]:
+        """将需求拆分为 static 驻留 / placeholder 驻留两个列表。
+
+        placement.gpu_resident = _static_gpu_resident（静态驻留），
+        placement.placeholder_resident = 动态加载的 placeholder。
+        两者在 executor 中分别对应 static_hit 与 placeholder_hit。
+        """
+        static_ids: List[int] = []
+        placeholder_ids: List[int] = []
+        for d in (demands or []):
+            key = (d.key.layer, d.key.expert_id)
+            if key in placement.gpu_resident:
+                static_ids.append(d.key.expert_id)
+            elif key in placement.placeholder_resident:
+                placeholder_ids.append(d.key.expert_id)
+        return static_ids, placeholder_ids
+
+    cur_static, cur_placeholder = _split_resident(current_demands)
+    fut_static, fut_placeholder = _split_resident(future_demands)
     return {
         "gpu_resident_count": len(placement.gpu_resident),
         "placeholder_resident_count": len(placement.placeholder_resident),
@@ -48,8 +64,12 @@ def _placement_summary(placement: Optional[PlacementSnapshot], current_demands: 
         "cpu_resident_count": len(placement.cpu_resident),
         "ssd_resident_count": len(placement.ssd_resident),
         "free_placeholders": placement.free_placeholders,
-        "current_resident": sorted(current_resident),
-        "future_resident": sorted(future_resident),
+        "current_static_resident": sorted(cur_static),
+        "current_placeholder_resident": sorted(cur_placeholder),
+        "current_resident": sorted(cur_static + cur_placeholder),
+        "future_static_resident": sorted(fut_static),
+        "future_placeholder_resident": sorted(fut_placeholder),
+        "future_resident": sorted(fut_static + fut_placeholder),
     }
 
 
@@ -634,7 +654,7 @@ class PDScopeScheduler(ExpertScheduler):
         # 当前层驻留充足但下一层不足，预加载下一层专家（mode-b）
             need_next = max(0, n_g_rho - next_resident_count)
             preload = future_non_resident[:need_next]
-            gpu = current_resident[:n_g_rho] # 当前层 GPU 专家保持在理想数量 n_g_rho，剩余放 CPU
+            gpu = current_resident # GPU 驻留专家权重已在 GPU，全部走 GPU 计算；CPU 路径只放非驻留专家
             gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
             cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
             schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=preload, evict=[], reason="decode-mode-b")
@@ -647,7 +667,7 @@ class PDScopeScheduler(ExpertScheduler):
             #     )
             return schedule
 
-        gpu = current_resident[:n_g_rho]
+        gpu = current_resident # GPU 驻留专家权重已在 GPU，全部走 GPU 计算；CPU 路径只放非驻留专家
         gpu_keys = {(d.key.layer, d.key.expert_id) for d in gpu}
         cpu = [d for d in current if (d.key.layer, d.key.expert_id) not in gpu_keys]
         schedule = ExpertSchedule(cpu=cpu, gpu=gpu, preload=[], evict=[], reason="decode-mode-c")

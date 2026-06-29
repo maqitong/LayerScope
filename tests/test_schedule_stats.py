@@ -219,7 +219,11 @@ def test_placement_summary():
     assert result["placeholder_resident_count"] == 1
     assert result["loading_count"] == 1
     assert result["free_placeholders"] == 1
+    assert result["current_static_resident"] == [1]
+    assert result["current_placeholder_resident"] == []
     assert result["current_resident"] == [1]
+    assert result["future_static_resident"] == []
+    assert result["future_placeholder_resident"] == []
 
 
 def test_latency_summary():
@@ -317,39 +321,39 @@ class TestHitSourceCounters:
         executor = self._make_executor()
         ctx = self._make_context([0])
         executor.execute_gpu_experts(ctx, [0])
-        assert executor.static_gpu_hit_count == 1
-        assert executor.static_gpu_hit_tokens == 2
-        assert executor.placeholder_hit_count == 0
-        assert executor.ondemand_load_count == 0
+        assert executor.gpu_experts_static_hit_count == 1
+        assert executor.gpu_experts_static_hit_tokens == 2
+        assert executor.gpu_experts_placeholder_hit_count == 0
+        assert executor.gpu_experts_ondemand_count == 0
 
     def test_placeholder_hit_counter(self):
         executor = self._make_executor()
         ctx = self._make_context([1])
         executor.execute_gpu_experts(ctx, [1])
-        assert executor.placeholder_hit_count == 1
-        assert executor.placeholder_hit_tokens == 2
-        assert executor.static_gpu_hit_count == 0
-        assert executor.ondemand_load_count == 0
+        assert executor.gpu_experts_placeholder_hit_count == 1
+        assert executor.gpu_experts_placeholder_hit_tokens == 2
+        assert executor.gpu_experts_static_hit_count == 0
+        assert executor.gpu_experts_ondemand_count == 0
 
     def test_ondemand_load_counter(self):
         executor = self._make_executor()
         ctx = self._make_context([5])
         executor.execute_gpu_experts(ctx, [5])
-        assert executor.ondemand_load_count == 1
-        assert executor.ondemand_load_tokens == 2
-        assert executor.static_gpu_hit_count == 0
-        assert executor.placeholder_hit_count == 0
+        assert executor.gpu_experts_ondemand_count == 1
+        assert executor.gpu_experts_ondemand_tokens == 2
+        assert executor.gpu_experts_static_hit_count == 0
+        assert executor.gpu_experts_placeholder_hit_count == 0
 
     def test_mixed_counters(self):
         executor = self._make_executor()
         ctx = self._make_context([0, 1, 5], n_tokens=3)
         executor.execute_gpu_experts(ctx, [0, 1, 5])
-        assert executor.static_gpu_hit_count == 1
-        assert executor.placeholder_hit_count == 1
-        assert executor.ondemand_load_count == 1
-        assert executor.static_gpu_hit_tokens == 3
-        assert executor.placeholder_hit_tokens == 3
-        assert executor.ondemand_load_tokens == 3
+        assert executor.gpu_experts_static_hit_count == 1
+        assert executor.gpu_experts_placeholder_hit_count == 1
+        assert executor.gpu_experts_ondemand_count == 1
+        assert executor.gpu_experts_static_hit_tokens == 3
+        assert executor.gpu_experts_placeholder_hit_tokens == 3
+        assert executor.gpu_experts_ondemand_tokens == 3
 
     def test_wait_for_preload_returns_false_on_cpu(self):
         executor = self._make_executor()

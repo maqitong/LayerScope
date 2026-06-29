@@ -23,6 +23,13 @@
     - gpu:       该模式分配到 GPU 执行的专家总次数
     - cpu:       该模式分配到 CPU 执行的专家总次数
     - preload:   该模式预加载的专家总次数
+
+preload overlap 分析列:
+    - next_static:           下一层 static 驻留专家数（对应 executor static_hit）
+    - next_placeholder:      下一层 placeholder 驻留专家数（对应 executor placeholder_hit）
+    - next_non_resident:     下一层需要 I/O 加载的专家数（对应 executor ondemand，coverage 有效分母）
+    - next_coverage:         overlap / total_next_demands（含 CPU 专家的全量分母）
+    - next_coverage_non_resident:  overlap_non_res / next_non_resident（仅非驻留专家为分母）
 """
 
 import argparse
@@ -75,6 +82,10 @@ def replay_decode_step(record: Dict) -> Dict:
     k = len(current_demands)
     current_resident_ids = placement.get("current_resident", [])
     future_resident_ids = placement.get("future_resident", [])
+    current_static_ids = placement.get("current_static_resident", current_resident_ids)
+    current_placeholder_ids = placement.get("current_placeholder_resident", [])
+    future_static_ids = placement.get("future_static_resident", future_resident_ids)
+    future_placeholder_ids = placement.get("future_placeholder_resident", [])
 
     n_g_rho_values = []
     for n_g in range(k + 1):
@@ -170,8 +181,12 @@ def replay_decode_step(record: Dict) -> Dict:
         "gpu_ids": gpu_ids,
         "preload_ids": preload_ids,
         "current_resident_ids": current_resident_ids,
+        "current_static_ids": current_static_ids,
+        "current_placeholder_ids": current_placeholder_ids,
         "current_non_resident_ids": current_non_resident_ids,
         "future_resident_ids": future_resident_ids,
+        "future_static_ids": future_static_ids,
+        "future_placeholder_ids": future_placeholder_ids,
         "preload_capacity": preload_capacity,
         "t_gap": round(t_gap, 6),
         "xi": round(xi, 6),
@@ -279,9 +294,9 @@ def format_steps(record: Dict, steps: Dict) -> str:
             marker = " ← optimal" if entry["n_g"] == steps["n_g_rho"] else ""
             lines.append(f"    n_g={entry['n_g']}: gpu_time={entry['gpu_time']:.4f}  cpu_time={entry['cpu_time']:.4f}  wall={entry['wall']:.4f}{marker}")
         lines.append(f"  n_g_rho={steps['n_g_rho']}")
-        lines.append(f"  current_resident={steps['current_resident_ids']} (count={steps['current_resident_count']})")
+        lines.append(f"  current_static={steps['current_static_ids']}  current_placeholder={steps['current_placeholder_ids']}")
         lines.append(f"  current_non_resident={steps['current_non_resident_ids']}")
-        lines.append(f"  next_resident_count={steps['next_resident_count']}  (future_resident={steps['future_resident_ids']})")
+        lines.append(f"  next_resident_count={steps['next_resident_count']}  (future_static={steps['future_static_ids']}, future_placeholder={steps['future_placeholder_ids']})")
         lines.append(f"  cur_below={steps['cur_below']}  next_below={steps['next_below']}")
         lines.append(f"  → mode={steps['mode_selected']}")
         lines.append(f"  ── Decision ──")
@@ -405,8 +420,13 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
             "matched_next_calls": 0,
             "overlap_count": 0,
             "total_next_demands": 0,
+            "total_next_static": 0,
+            "total_next_placeholder": 0,
+            "total_next_non_resident": 0,
+            "overlap_with_non_resident": 0,
             "precision": 0.0,
             "next_coverage": 0.0,
+            "next_coverage_non_resident": 0.0,
             "wasted_preload": 0,
             "by_reason": {},
             "examples": [],
@@ -415,9 +435,17 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
     total_preloaded = 0
     overlap_count = 0
     total_next_demands = 0
+    total_next_static = 0
+    total_next_placeholder = 0
+    total_next_non_resident = 0
+    overlap_with_non_resident = 0
     matched = 0
     wasted = 0
-    by_reason = defaultdict(lambda: {"calls": 0, "preloaded": 0, "overlap": 0, "next_demands": 0, "wasted": 0})
+    by_reason = defaultdict(lambda: {
+        "calls": 0, "preloaded": 0, "overlap": 0,
+        "next_demands": 0, "next_static": 0, "next_placeholder": 0, "next_non_resident": 0,
+        "overlap_non_resident": 0, "wasted": 0,
+    })
     examples = []
 
     for idx, rec in preload_records:
@@ -447,9 +475,30 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
                 next_ids = set(d["expert_id"] for d in next_demands)
             else:
                 next_ids = set()
+
+            next_placement = next_rec.get("placement", {})
+            next_static_ids = set(next_placement.get("current_static_resident", []))
+            next_placeholder_ids = set(next_placement.get("current_placeholder_resident", []))
+            if not next_static_ids and not next_placeholder_ids:
+                next_resident_ids = set(next_placement.get("current_resident", []))
+                next_static_ids = next_resident_ids
+                next_placeholder_ids = set()
+            else:
+                next_resident_ids = next_static_ids | next_placeholder_ids
+
+            next_static_in_demands = next_static_ids & next_ids
+            next_placeholder_in_demands = next_placeholder_ids & next_ids
+            next_non_resident_ids = next_ids - next_resident_ids
+
             total_next_demands += len(next_ids)
+            total_next_static += len(next_static_in_demands)
+            total_next_placeholder += len(next_placeholder_in_demands)
+            total_next_non_resident += len(next_non_resident_ids)
+
             overlap = preload_ids & next_ids
+            overlap_nr = preload_ids & next_non_resident_ids
             overlap_count += len(overlap)
+            overlap_with_non_resident += len(overlap_nr)
             w = len(preload_ids) - len(overlap)
             wasted += w
 
@@ -458,6 +507,10 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
             br["preloaded"] += len(preload_ids)
             br["overlap"] += len(overlap)
             br["next_demands"] += len(next_ids)
+            br["next_static"] += len(next_static_in_demands)
+            br["next_placeholder"] += len(next_placeholder_in_demands)
+            br["next_non_resident"] += len(next_non_resident_ids)
+            br["overlap_non_resident"] += len(overlap_nr)
             br["wasted"] += w
 
             if limit > 0 and len(examples) < limit:
@@ -468,8 +521,13 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
                     "reason": reason,
                     "preload_ids": sorted(preload_ids),
                     "next_actual_ids": sorted(next_ids),
+                    "next_static_ids": sorted(next_static_in_demands),
+                    "next_placeholder_ids": sorted(next_placeholder_in_demands),
+                    "next_non_resident_ids": sorted(next_non_resident_ids),
                     "overlap": sorted(overlap),
+                    "overlap_non_resident": sorted(overlap_nr),
                     "precision": round(len(overlap) / max(len(preload_ids), 1), 4),
+                    "coverage_non_resident": round(len(overlap_nr) / max(len(next_non_resident_ids), 1), 4),
                     "wasted": w,
                 })
         else:
@@ -499,8 +557,13 @@ def compute_preload_overlap(records: List[Dict], limit: int = 0) -> Dict:
         "matched_next_calls": matched,
         "overlap_count": overlap_count,
         "total_next_demands": total_next_demands,
+        "total_next_static": total_next_static,
+        "total_next_placeholder": total_next_placeholder,
+        "total_next_non_resident": total_next_non_resident,
+        "overlap_with_non_resident": overlap_with_non_resident,
         "precision": round(overlap_count / max(total_preloaded, 1), 4),
         "next_coverage": round(overlap_count / max(total_next_demands, 1), 4),
+        "next_coverage_non_resident": round(overlap_with_non_resident / max(total_next_non_resident, 1), 4),
         "wasted_preload": wasted,
         "by_reason": {r: dict(v) for r, v in sorted(by_reason.items())},
         "examples": examples,
@@ -512,21 +575,25 @@ def print_preload_overlap(records: List[Dict], limit: int = 0) -> None:
     print(f"\n{'='*80}")
     print("Preload Overlap Analysis")
     print(f"{'='*80}")
-    print(f"preload_calls:        {result['preload_calls']}")
-    print(f"total_preloaded:      {result['total_preloaded']}")
-    print(f"matched_next_calls:   {result['matched_next_calls']}")
-    print(f"overlap_count:        {result['overlap_count']}")
-    print(f"total_next_demands:   {result['total_next_demands']}")
-    print(f"precision:            {result['precision']:.4f}  (overlap / total_preloaded)")
-    print(f"next_coverage:        {result['next_coverage']:.4f}  (overlap / total_next_demands)")
-    print(f"wasted_preload:       {result['wasted_preload']}")
+    print(f"preload_calls:              {result['preload_calls']}")
+    print(f"total_preloaded:            {result['total_preloaded']}")
+    print(f"matched_next_calls:         {result['matched_next_calls']}")
+    print(f"overlap_count:              {result['overlap_count']}")
+    print(f"total_next_demands:         {result['total_next_demands']}")
+    print(f"  next_static:              {result['total_next_static']}  (static 驻留, 对应 executor static_hit)")
+    print(f"  next_placeholder:         {result['total_next_placeholder']}  (placeholder 驻留, 对应 executor placeholder_hit)")
+    print(f"  next_non_resident:        {result['total_next_non_resident']}  (需要 I/O 加载, 对应 executor ondemand)")
+    print(f"precision:                  {result['precision']:.4f}  (overlap / total_preloaded)")
+    print(f"next_coverage:              {result['next_coverage']:.4f}  (overlap / total_next_demands)")
+    print(f"next_coverage_non_resident: {result['next_coverage_non_resident']:.4f}  (overlap_non_res / next_non_resident)")
+    print(f"wasted_preload:             {result['wasted_preload']}")
 
     if result["by_reason"]:
-        print(f"\n{'─'*80}")
-        print(f"{'reason':<30} {'calls':>6} {'preloaded':>10} {'overlap':>8} {'next_dem':>8} {'wasted':>8}")
-        print(f"{'─'*80}")
+        print(f"\n{'─'*100}")
+        print(f"{'reason':<30} {'calls':>6} {'preloaded':>10} {'overlap':>8} {'ovlp_nr':>8} {'next_dem':>8} {'next_static':>11} {'next_ph':>8} {'next_nr':>8} {'wasted':>8}")
+        print(f"{'─'*100}")
         for reason, stats in result["by_reason"].items():
-            print(f"{reason:<30} {stats['calls']:>6} {stats['preloaded']:>10} {stats['overlap']:>8} {stats['next_demands']:>8} {stats['wasted']:>8}")
+            print(f"{reason:<30} {stats['calls']:>6} {stats['preloaded']:>10} {stats['overlap']:>8} {stats['overlap_non_resident']:>8} {stats['next_demands']:>8} {stats['next_static']:>11} {stats['next_placeholder']:>8} {stats['next_non_resident']:>8} {stats['wasted']:>8}")
 
     if result["examples"]:
         print(f"\n{'─'*80}")
@@ -534,8 +601,10 @@ def print_preload_overlap(records: List[Dict], limit: int = 0) -> None:
         for ex in result["examples"]:
             note = f"  ({ex['note']})" if "note" in ex else ""
             print(f"  call_index={ex['call_index']} layer={ex['layer']} phase={ex['phase']} reason={ex['reason']}")
-            print(f"    preload={ex['preload_ids']}  next_actual={ex['next_actual_ids']}  overlap={ex['overlap']}")
-            print(f"    precision={ex['precision']:.4f}  wasted={ex['wasted']}{note}")
+            print(f"    preload={ex['preload_ids']}")
+            print(f"    next_static={ex.get('next_static_ids', [])}  next_placeholder={ex.get('next_placeholder_ids', [])}  next_non_resident={ex.get('next_non_resident_ids', [])}")
+            print(f"    overlap={ex['overlap']}  overlap_non_resident={ex.get('overlap_non_resident', [])}")
+            print(f"    precision={ex['precision']:.4f}  coverage_nr={ex.get('coverage_non_resident', 0):.4f}  wasted={ex['wasted']}{note}")
 
 
 def main():

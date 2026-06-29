@@ -148,7 +148,10 @@ class mDeepSeek:
         )
         ## 计时——加载hot专家和executor
         load_model_tick = time.time()
-        self.cpu_experts = self.clone_cpu_experts()
+        # 不再 clone 全部专家：模型置于 ext4 原生盘后 mmap 访问足够快，
+        # clone 全部 1664 个专家会多占 ~27GB CPU 内存（其中 861 个 hot 专家已在 GPU，无需 CPU 副本）。
+        # CPU 执行路径通过 get_cpu_expert 直接复用 self.model 中驻留 CPU 的专家。
+        self.cpu_experts = {}
         self.bring_expert_to_gpu()
         self.expert_executor = ExpertExecutionManager(
             device=self.dev,
@@ -257,13 +260,10 @@ class mDeepSeek:
 
     def clone_cpu_experts(self):
         cpu_experts = {}
-        pinned_count = 0
         for i in range(1, self.n_layer):
             for j in range(self.n_expert):
                 expert = copy.deepcopy(self.model.layers[i].mlp.experts[j]).to("cpu")
-                pinned_count += self.pin_module_tensors(expert)
                 cpu_experts[(i, j)] = expert
-        print(f"Pinned CPU expert source tensors: {pinned_count}")
         return cpu_experts
 
     def pin_module_tensors(self, module):
@@ -359,6 +359,7 @@ class mDeepSeek:
         probs = torch.full((input_ids.shape[0],), 1.0, device=self.dev)
 
         for i_token in range(output_token):
+            print(i_token)
             if profiler is not None and i_token == 0:
                 profiler.start()
                 print("[profiler] profiling started (prefill)")
@@ -491,12 +492,12 @@ class mDeepSeek:
             self.expert_executor.preload_skip_loading_count = 0
             self.expert_executor.preload_skip_no_slot_count = 0
             self.expert_executor.preload_hit_count = 0
-            self.expert_executor.static_gpu_hit_count = 0
-            self.expert_executor.static_gpu_hit_tokens = 0
-            self.expert_executor.placeholder_hit_count = 0
-            self.expert_executor.placeholder_hit_tokens = 0
-            self.expert_executor.ondemand_load_count = 0
-            self.expert_executor.ondemand_load_tokens = 0
+            self.expert_executor.gpu_experts_static_hit_count = 0
+            self.expert_executor.gpu_experts_static_hit_tokens = 0
+            self.expert_executor.gpu_experts_placeholder_hit_count = 0
+            self.expert_executor.gpu_experts_placeholder_hit_tokens = 0
+            self.expert_executor.gpu_experts_ondemand_count = 0
+            self.expert_executor.gpu_experts_ondemand_tokens = 0
             self.expert_executor.reset_timing_stats()
 
         if clear_placeholders:

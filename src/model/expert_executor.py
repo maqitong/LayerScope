@@ -31,12 +31,14 @@ class ExpertExecutionManager:
         self.preload_skip_loading_count = 0
         self.preload_skip_no_slot_count = 0
         self.preload_hit_count = 0
-        self.static_gpu_hit_count = 0
-        self.static_gpu_hit_tokens = 0
-        self.placeholder_hit_count = 0
-        self.placeholder_hit_tokens = 0
-        self.ondemand_load_count = 0
-        self.ondemand_load_tokens = 0
+        self.gpu_experts_static_hit_count = 0
+        self.gpu_experts_static_hit_tokens = 0
+        self.gpu_experts_placeholder_hit_count = 0
+        self.gpu_experts_placeholder_hit_tokens = 0
+        self.gpu_experts_ondemand_count = 0
+        self.gpu_experts_ondemand_tokens = 0
+        self.cpu_experts_hit_count = 0
+        self.cpu_experts_hit_tokens = 0
 
     def execute(self, schedule: ExpertSchedule, context: ExpertLayerContext) -> torch.Tensor:
         gpu_result = None
@@ -64,7 +66,7 @@ class ExpertExecutionManager:
         if gpu_result is not None:
             result += gpu_result
         if cpu_result is not None:
-            result += cpu_result.to(self.device, non_blocking=True)
+            result += cpu_result.to(self.device)
         if self.profile_timing:
             self._sync_cuda()
             self._add_timing(context.layer, "wall", time.perf_counter() - wall_tick)
@@ -205,13 +207,13 @@ class ExpertExecutionManager:
             current_state = context.inps_flat.index_select(0, token_indices)
             placeholder = self.placeholder_manager.get_placeholder_for_expert(context.layer, expert_id)
             if self.placeholder_manager.is_static_gpu_resident(context.layer, expert_id):
-                self.static_gpu_hit_count += 1
-                self.static_gpu_hit_tokens += n_tokens
+                self.gpu_experts_static_hit_count += 1
+                self.gpu_experts_static_hit_tokens += n_tokens
                 current_state = context.experts[expert_id](current_state)
             elif placeholder is not None:
                 was_preloaded = self._wait_for_preload(context.layer, expert_id)
-                self.placeholder_hit_count += 1
-                self.placeholder_hit_tokens += n_tokens
+                self.gpu_experts_placeholder_hit_count += 1
+                self.gpu_experts_placeholder_hit_tokens += n_tokens
                 if was_preloaded:
                     self.preload_hit_count += 1
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
@@ -220,8 +222,8 @@ class ExpertExecutionManager:
                 finally:
                     self.placeholder_manager.unprotect_expert(context.layer, expert_id)
             else:
-                self.ondemand_load_count += 1
-                self.ondemand_load_tokens += n_tokens
+                self.gpu_experts_ondemand_count += 1
+                self.gpu_experts_ondemand_tokens += n_tokens
                 placeholder = self.placeholder_manager.acquire_placeholder(context.layer, expert_id)
                 if placeholder is None:
                     raise RuntimeError(f"No placeholder available for expert ({context.layer}, {expert_id})")
@@ -245,14 +247,16 @@ class ExpertExecutionManager:
             token_indices_gpu = assignment.token_indices.to(
                 device=context.inps_flat.device,
                 dtype=torch.long,
-                non_blocking=True,
             ).contiguous()
-            token_indices_cpu = token_indices_gpu.to("cpu", non_blocking=True)
+            token_indices_cpu = token_indices_gpu.to("cpu")
+            n_tokens = token_indices_gpu.shape[0]
              
             current_state = context.inps_flat.index_select(0, token_indices_gpu)
             current_state = self.get_cpu_expert(context.layer, expert_id)(current_state.to("cpu"))
             current_state = current_state * assignment.routing_weights.to("cpu")
             result.index_add_(0, token_indices_cpu, current_state.to(result.dtype))
+            self.cpu_experts_hit_count += 1
+            self.cpu_experts_hit_tokens += n_tokens
         return result
 
     def get_cpu_expert(self, layer: int, expert_id: int):
