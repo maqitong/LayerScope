@@ -317,43 +317,58 @@ class TestHitSourceCounters:
             assignments=assignments,
         )
 
-    def test_static_gpu_hit_counter(self):
+    def test_planned_static_gpu_counter(self):
         executor = self._make_executor()
-        ctx = self._make_context([0])
-        executor.execute_gpu_experts(ctx, [0])
-        assert executor.gpu_experts_static_hit_count == 1
-        assert executor.gpu_experts_static_hit_tokens == 2
-        assert executor.gpu_experts_placeholder_hit_count == 0
-        assert executor.gpu_experts_ondemand_count == 0
+        schedule = ExpertSchedule(gpu=[ExpertDemand(ExpertKey(1, 0), 2)])
+        placement = PlacementSnapshot(gpu_resident={(1, 0)})
+        executor.record_planned_execution_stats(schedule, placement)
+        assert executor.planned_gpu_static_count == 1
+        assert executor.planned_gpu_static_tokens == 2
+        assert executor.planned_gpu_placeholder_count == 0
+        assert executor.planned_gpu_ondemand_count == 0
 
-    def test_placeholder_hit_counter(self):
+    def test_planned_placeholder_counter(self):
         executor = self._make_executor()
-        ctx = self._make_context([1])
-        executor.execute_gpu_experts(ctx, [1])
-        assert executor.gpu_experts_placeholder_hit_count == 1
-        assert executor.gpu_experts_placeholder_hit_tokens == 2
-        assert executor.gpu_experts_static_hit_count == 0
-        assert executor.gpu_experts_ondemand_count == 0
+        schedule = ExpertSchedule(gpu=[ExpertDemand(ExpertKey(1, 1), 2)])
+        placement = PlacementSnapshot(placeholder_resident={(1, 1)})
+        executor.record_planned_execution_stats(schedule, placement)
+        assert executor.planned_gpu_placeholder_count == 1
+        assert executor.planned_gpu_placeholder_tokens == 2
+        assert executor.planned_gpu_static_count == 0
+        assert executor.planned_gpu_ondemand_count == 0
 
-    def test_ondemand_load_counter(self):
+    def test_planned_ondemand_counter(self):
         executor = self._make_executor()
-        ctx = self._make_context([5])
-        executor.execute_gpu_experts(ctx, [5])
-        assert executor.gpu_experts_ondemand_count == 1
-        assert executor.gpu_experts_ondemand_tokens == 2
-        assert executor.gpu_experts_static_hit_count == 0
-        assert executor.gpu_experts_placeholder_hit_count == 0
+        schedule = ExpertSchedule(gpu=[ExpertDemand(ExpertKey(1, 5), 2)])
+        placement = PlacementSnapshot()
+        executor.record_planned_execution_stats(schedule, placement)
+        assert executor.planned_gpu_ondemand_count == 1
+        assert executor.planned_gpu_ondemand_tokens == 2
+        assert executor.planned_gpu_static_count == 0
+        assert executor.planned_gpu_placeholder_count == 0
 
-    def test_mixed_counters(self):
+    def test_mixed_planned_counters(self):
         executor = self._make_executor()
-        ctx = self._make_context([0, 1, 5], n_tokens=3)
-        executor.execute_gpu_experts(ctx, [0, 1, 5])
-        assert executor.gpu_experts_static_hit_count == 1
-        assert executor.gpu_experts_placeholder_hit_count == 1
-        assert executor.gpu_experts_ondemand_count == 1
-        assert executor.gpu_experts_static_hit_tokens == 3
-        assert executor.gpu_experts_placeholder_hit_tokens == 3
-        assert executor.gpu_experts_ondemand_tokens == 3
+        schedule = ExpertSchedule(
+            cpu=[ExpertDemand(ExpertKey(1, 9), 4)],
+            gpu=[
+                ExpertDemand(ExpertKey(1, 0), 3),
+                ExpertDemand(ExpertKey(1, 1), 3),
+                ExpertDemand(ExpertKey(1, 5), 3),
+            ],
+            preload=[ExpertDemand(ExpertKey(2, 7), 1, source="predicted")],
+        )
+        placement = PlacementSnapshot(gpu_resident={(1, 0)}, placeholder_resident={(1, 1)})
+        executor.record_planned_execution_stats(schedule, placement)
+        assert executor.planned_gpu_static_count == 1
+        assert executor.planned_gpu_placeholder_count == 1
+        assert executor.planned_gpu_ondemand_count == 1
+        assert executor.planned_gpu_static_tokens == 3
+        assert executor.planned_gpu_placeholder_tokens == 3
+        assert executor.planned_gpu_ondemand_tokens == 3
+        assert executor.planned_cpu_count == 1
+        assert executor.planned_cpu_tokens == 4
+        assert executor.planned_preload_count == 1
 
     def test_wait_for_preload_returns_false_on_cpu(self):
         executor = self._make_executor()

@@ -37,3 +37,4 @@ class GatePredictor(ExpertPredictor):
         next_layer = model.layers[next_layer_idx]
         predicted_experts, routing_weights = next_layer.mlp.gate(hidden_states)
         return build_future_demands(next_layer_idx, predicted_experts, routing_weights)
+

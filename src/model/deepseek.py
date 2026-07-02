@@ -14,14 +14,15 @@ import transformers
 from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2RotaryEmbedding
 from transformers.masking_utils import create_causal_mask
 
+from tqdm import tqdm
 from model.expert_scheduling import (
     ExpertSchedulingStrategy,
-    ExpertSchedulingStatsRecorder,
     GPUOnlyStrategy,
     FiddlerStrategy,
-    PrefetchHybridStrategy,
-    _build_latency_lookup,
+    PDScopeScheduler,
+    PregatedStrategy,
 )
+from model.expert_monitor import ExpertSchedulingStatsRecorder
 from model.placeholder_manager import ExpertPlaceholderManager
 from model.eviction_strategy import LRUEvictionStrategy, FIFOEvictionStrategy
 from model.expert_predictor import ExpertPredictor, GatePredictor
@@ -54,7 +55,7 @@ class mDeepSeek:
         self.placeholder_manager = ExpertPlaceholderManager(
             template_expert=template_expert,
             device=self.dev,
-            num_placeholders= 4 * self.model.config.num_experts_per_tok,  # 每层非共享专家的两倍占位符数量
+            num_placeholders= 4 * self.model.config.num_experts_per_tok,  # 每层非共享专家的四倍占位符数量
             eviction_strategy=FIFOEvictionStrategy(),
             # eviction_strategy=LRUEvictionStrategy(),
         )
@@ -80,53 +81,29 @@ class mDeepSeek:
 
         ### 加载基准数据，设置专家调度策略的 CPU/GPU 延迟参数
         self.latency_model = ExpertLatencyModel(
-            t_io=0.35, #ms
+            t_io=0.4, #ms
             latency_cpu_table={1: 1.5},
             latency_gpu_table={1: 0.093},
         )
-        # benchmark_data = self._load_benchmark_data(args.model)
-        benchmark_data = None
-        loaded_benchmark_latency = False
-        if benchmark_data is not None:
-            try:
-                self.latency_model = ExpertLatencyModel(
-                    t_io=benchmark_data["expert_weight_copy"]["avg_ms"],
-                    latency_cpu_table=_build_latency_lookup(benchmark_data["expert_cpu"]),
-                    latency_gpu_table=_build_latency_lookup(benchmark_data["expert_gpu"]),
-                )
-                loaded_benchmark_latency = True
-            except (KeyError, TypeError) as e:
-                print(f"Warning: Malformed benchmark data, using defaults: {e}")
-        if loaded_benchmark_latency:
-            print(
-                "Loaded benchmark latency_model "
-                f"cpu_table={self.latency_model.latency_cpu_table}, "
-                f"gpu_table={self.latency_model.latency_gpu_table}, "
-                f"t_io={self.latency_model.t_io:.4f}ms"
-            )
-        else:
-            print(
-                "Benchmark file not found, using default latency_model "
-                f"cpu_table={self.latency_model.latency_cpu_table}, "
-                f"gpu_table={self.latency_model.latency_gpu_table}, "
-                f"t_io={self.latency_model.t_io}ms"
-            )
 
         self.hot_expert_counts = Counter()
 
         # 初始化策略
-        if args.cpu_offload == 0:
-            self.expert_strategy = GPUOnlyStrategy(self.dev, self.is_expert_in_gpu)
-        elif args.cpu_offload == 1:
-            self.expert_strategy = PrefetchHybridStrategy(
-                self.dev, self.is_expert_in_gpu,
-                latency_model=self.latency_model,
-            )
-        else:
-            self.expert_strategy = FiddlerStrategy(
-                self.dev, self.is_expert_in_gpu,
-                latency_model=self.latency_model,
-            )
+        strategy_map = {
+            0: GPUOnlyStrategy,
+            1: PregatedStrategy,
+            2: FiddlerStrategy,
+            2: PDScopeScheduler,
+        }
+        if args.cpu_offload not in strategy_map:
+            raise ValueError(f"Unknown cpu_offload value: {args.cpu_offload}")
+
+        strategy_cls = strategy_map[args.cpu_offload]
+        self.expert_strategy = strategy_cls(
+            self.dev, self.is_expert_in_gpu,
+            latency_model=self.latency_model,
+        )
+        
         print(f"Initialized expert scheduling strategy: {self.expert_strategy.__class__.__name__}")
 
         self._init_schedule_stats_recorder(args)
@@ -184,26 +161,8 @@ class mDeepSeek:
         self.schedule_stats_recorder: Optional[ExpertSchedulingStatsRecorder] = None
         if not record_schedule:
             return
-        runtime_meta = {
-            "cpu_offload": args.cpu_offload,
-            "model": getattr(args, "model", ""),
-            "batch_size": args.batch_size,
-            "beam_width": args.beam_width,
-            "n_layer": self.n_layer,
-            "n_expert": self.n_expert,
-            "n_shared_experts": self.n_shared_experts,
-            "num_placeholders": self.placeholder_manager.num_placeholders,
-            "eviction_strategy": type(self.placeholder_manager._eviction_strategy).__name__ if self.placeholder_manager._eviction_strategy else None,
-            "latency_model": {
-                "t_io": self.latency_model.t_io,
-                "latency_cpu_table": {str(k): v for k, v in self.latency_model.latency_cpu_table.items()},
-                "latency_gpu_table": {str(k): v for k, v in self.latency_model.latency_gpu_table.items()},
-            },
-            "strategy": self.expert_strategy.__class__.__name__,
-        }
         self.schedule_stats_recorder = ExpertSchedulingStatsRecorder(
             output_path=schedule_log,
-            runtime_meta=runtime_meta,
         )
         self.expert_strategy.set_stats_recorder(self.schedule_stats_recorder)
         if schedule_log:
@@ -357,7 +316,7 @@ class mDeepSeek:
         search_start = False
         probs = torch.full((input_ids.shape[0],), 1.0, device=self.dev)
 
-        for i_token in range(output_token):
+        for i_token in tqdm(range(output_token), desc="Generating tokens"):
             if profiler is not None and i_token == 0:
                 profiler.start()
                 print("[profiler] profiling started (prefill)")
@@ -459,8 +418,8 @@ class mDeepSeek:
             decoded_outputs = self.tokenizer.batch_decode(selected_tokens.detach().cpu(), skip_special_tokens=False)
 
         print("--------------------")
-        print(f"Input: {text[:128]}")
-        print(f"Output: {decoded_outputs[0]}")
+        print(f"Input: {text[0][:128]}")
+        print(f"Output: {decoded_outputs[0][:32]}")
 
         if hasattr(self, "expert_executor"):
             self.expert_executor.shutdown()
@@ -476,19 +435,7 @@ class mDeepSeek:
         self.predicted_next_demands = []
 
         if hasattr(self, "expert_executor"):
-            self.expert_executor.preload_request_count = 0
-            self.expert_executor.preload_success_count = 0
-            self.expert_executor.preload_skip_count = 0
-            self.expert_executor.preload_skip_already_gpu_count = 0
-            self.expert_executor.preload_skip_loading_count = 0
-            self.expert_executor.preload_skip_no_slot_count = 0
-            self.expert_executor.preload_hit_count = 0
-            self.expert_executor.gpu_experts_static_hit_count = 0
-            self.expert_executor.gpu_experts_static_hit_tokens = 0
-            self.expert_executor.gpu_experts_placeholder_hit_count = 0
-            self.expert_executor.gpu_experts_placeholder_hit_tokens = 0
-            self.expert_executor.gpu_experts_ondemand_count = 0
-            self.expert_executor.gpu_experts_ondemand_tokens = 0
+            self.expert_executor.reset_runtime_counters()
             self.expert_executor.reset_timing_stats()
 
         if clear_placeholders:
@@ -610,7 +557,7 @@ class mDeepSeek:
 
             # 预测下一层活跃专家：仅当策略会消费 future_demands 进行预加载时才跑，
             # 避免 GPUOnly/Fiddler 白跑一次下一层 gate 前向 + .cpu().tolist() 同步
-            if isinstance(self.expert_strategy, PrefetchHybridStrategy) and i_layer + 1 < self.n_layer:
+            if isinstance(self.expert_strategy, (PDScopeScheduler, PregatedStrategy)) and i_layer + 1 < self.n_layer:
                 pred_result = self.expert_predictor.predict(inps, self.model, i_layer, 1)
                 self.predicted_next_demands = pred_result or []
             else:
@@ -624,12 +571,13 @@ class mDeepSeek:
         
             # 选择策略
             strategy = self.expert_strategy
+            placement = self.placeholder_manager.snapshot()
 
-            # 策略决策和预处理（PrefetchHybridStrategy 返回 4-tuple）
+            # 策略决策和预处理（PDScopeScheduler 返回 4-tuple）
             result_tuple = strategy.decide_and_prepare(
                 i_layer, experts, selected_experts, routing_weights, self.n_expert,
                 future_demands=self.predicted_next_demands,
-                placement=self.placeholder_manager.snapshot(),
+                placement=placement,
                 is_prefill=is_prefill,
             )
             if len(result_tuple) == 4:
@@ -639,14 +587,12 @@ class mDeepSeek:
                 prefetch_experts = []
             # print(f"Layer {i_layer}: GPU experts: {gpu_experts}, CPU experts: {cpu_experts}, Prefetch: {prefetch_experts}")
 
-
-            
-
             schedule = ExpertSchedule(
                 cpu=[ExpertDemand(ExpertKey(i_layer, eid), expert_assignments[eid][0].shape[0]) for eid in cpu_experts],
                 gpu=[ExpertDemand(ExpertKey(i_layer, eid), expert_assignments[eid][0].shape[0]) for eid in gpu_experts],
                 preload=[ExpertDemand(ExpertKey(i_layer + 1, eid), 1, source="predicted") for eid in prefetch_experts],
             )
+            self.expert_executor.record_planned_execution_stats(schedule, placement)
             context = ExpertLayerContext(
                 layer=i_layer,
                 experts=experts,

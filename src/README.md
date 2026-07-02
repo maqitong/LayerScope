@@ -30,7 +30,7 @@ PYTHONPATH=src python scripts/infer_deepseek.py \
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--cpu-offload` | int | `1` | 专家调度策略选择：<br>`0` — GPUOnlyStrategy：所有活跃专家走 GPU 执行（baseline）<br>`1` — PrefetchHybridStrategy：PDScope 策略，区分 prefill/decode 阶段，支持预取<br>`2` — FiddlerStrategy：逐专家 CPU/GPU 代价最优选择 |
+| `--cpu-offload` | int | `1` | 专家调度策略选择：<br>`0` — GPUOnlyStrategy：所有活跃专家走 GPU 执行（baseline）<br>`1` — PrefetchHybridStrategy：PDScope 策略，区分 prefill/decode 阶段，支持预取<br>`2` — FiddlerStrategy：逐专家 CPU/GPU 代价最优选择<br>`3` — PregatedStrategy：活跃专家全部上 GPU，仅用门控预测下一层专家做预加载 |
 
 ### Warmup 与缓存
 

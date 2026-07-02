@@ -4,11 +4,11 @@
   "expert_cpu": [
     {
       "token_count": 1,
-      "avg_time_ms": 0.1432
+      "avg_time_ms": 0.4
     },
     {
       "token_count": 2,
-      "avg_time_ms": 0.2154
+      "avg_time_ms": 0.4
     },
     {
       "token_count": 4,

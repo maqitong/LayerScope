@@ -24,27 +24,14 @@ class ExpertExecutionManager:
         self._timing_stats = defaultdict(lambda: defaultdict(float))
         self._preload_event_lock = threading.Lock()
         self._preload_events = {}
-        self.preload_request_count = 0
-        self.preload_success_count = 0
-        self.preload_skip_count = 0
-        self.preload_skip_already_gpu_count = 0
-        self.preload_skip_loading_count = 0
-        self.preload_skip_no_slot_count = 0
-        self.preload_hit_count = 0
-        self.gpu_experts_static_hit_count = 0
-        self.gpu_experts_static_hit_tokens = 0
-        self.gpu_experts_placeholder_hit_count = 0
-        self.gpu_experts_placeholder_hit_tokens = 0
-        self.gpu_experts_ondemand_count = 0
-        self.gpu_experts_ondemand_tokens = 0
-        self.cpu_experts_hit_count = 0
-        self.cpu_experts_hit_tokens = 0
+        self.reset_runtime_counters()
 
     def execute(self, schedule: ExpertSchedule, context: ExpertLayerContext) -> torch.Tensor:
         gpu_result = None
         cpu_result = None
         wall_tick = time.perf_counter()
         caller_stream = torch.cuda.current_stream(self.device) if self._is_cuda_device() else None
+        copy_stream = self.compute_stream if self._is_cuda_device() else None
         pool = self._ensure_pool()
         futures = {}
         if schedule.gpu_expert_ids:
@@ -70,7 +57,7 @@ class ExpertExecutionManager:
         if self.profile_timing:
             self._sync_cuda()
             self._add_timing(context.layer, "wall", time.perf_counter() - wall_tick)
-            self._add_timing(context.layer, "calls", 1.0)
+            self._add_timing(context.layer, "calls", 1.0)    
         return result
 
     def reset_timing_stats(self) -> None:
@@ -78,6 +65,43 @@ class ExpertExecutionManager:
             self._timing_stats.clear()
         with self._preload_event_lock:
             self._preload_events.clear()
+
+    def reset_runtime_counters(self) -> None:
+        self.planned_cpu_count = 0
+        self.planned_cpu_tokens = 0
+        self.planned_gpu_static_count = 0
+        self.planned_gpu_static_tokens = 0
+        self.planned_gpu_placeholder_count = 0
+        self.planned_gpu_placeholder_tokens = 0
+        self.planned_gpu_ondemand_count = 0
+        self.planned_gpu_ondemand_tokens = 0
+        self.planned_preload_count = 0
+        self.actual_preload_request_count = 0
+        self.actual_preload_success_count = 0
+        self.actual_preload_skip_count = 0
+        self.actual_preload_skip_already_gpu_count = 0
+        self.actual_preload_skip_loading_count = 0
+        self.actual_preload_skip_no_slot_count = 0
+        self.actual_preload_hit_count = 0
+
+    def record_planned_execution_stats(self, schedule: ExpertSchedule, placement) -> None:
+        self.planned_preload_count += len(schedule.preload)
+
+        for demand in schedule.cpu:
+            self.planned_cpu_count += 1
+            self.planned_cpu_tokens += demand.token_count
+
+        for demand in schedule.gpu:
+            key = (demand.key.layer, demand.key.expert_id)
+            if key in placement.gpu_resident:
+                self.planned_gpu_static_count += 1
+                self.planned_gpu_static_tokens += demand.token_count
+            elif key in placement.placeholder_resident:
+                self.planned_gpu_placeholder_count += 1
+                self.planned_gpu_placeholder_tokens += demand.token_count
+            else:
+                self.planned_gpu_ondemand_count += 1
+                self.planned_gpu_ondemand_tokens += demand.token_count
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         if self._pool is None:
@@ -207,23 +231,17 @@ class ExpertExecutionManager:
             current_state = context.inps_flat.index_select(0, token_indices)
             placeholder = self.placeholder_manager.get_placeholder_for_expert(context.layer, expert_id)
             if self.placeholder_manager.is_static_gpu_resident(context.layer, expert_id):
-                self.gpu_experts_static_hit_count += 1
-                self.gpu_experts_static_hit_tokens += n_tokens
                 current_state = context.experts[expert_id](current_state)
             elif placeholder is not None:
                 was_preloaded = self._wait_for_preload(context.layer, expert_id)
-                self.gpu_experts_placeholder_hit_count += 1
-                self.gpu_experts_placeholder_hit_tokens += n_tokens
                 if was_preloaded:
-                    self.preload_hit_count += 1
+                    self.actual_preload_hit_count += 1
                 self.placeholder_manager.protect_expert(context.layer, expert_id)
                 try:
                     current_state = placeholder(current_state)
                 finally:
                     self.placeholder_manager.unprotect_expert(context.layer, expert_id)
             else:
-                self.gpu_experts_ondemand_count += 1
-                self.gpu_experts_ondemand_tokens += n_tokens
                 placeholder = self.placeholder_manager.acquire_placeholder(context.layer, expert_id)
                 if placeholder is None:
                     raise RuntimeError(f"No placeholder available for expert ({context.layer}, {expert_id})")
@@ -255,8 +273,6 @@ class ExpertExecutionManager:
             current_state = self.get_cpu_expert(context.layer, expert_id)(current_state.to("cpu"))
             current_state = current_state * assignment.routing_weights.to("cpu")
             result.index_add_(0, token_indices_cpu, current_state.to(result.dtype))
-            self.cpu_experts_hit_count += 1
-            self.cpu_experts_hit_tokens += n_tokens
         return result
 
     def get_cpu_expert(self, layer: int, expert_id: int):
@@ -280,25 +296,26 @@ class ExpertExecutionManager:
             # tick = time.time()
             loaded = 0
             for expert_id in expert_ids:
-                self.preload_request_count += 1
+                self.actual_preload_request_count += 1
                 if self.is_expert_in_gpu(layer, expert_id) or self.placeholder_manager.is_on_gpu(layer, expert_id):
-                    self.preload_skip_already_gpu_count += 1
+                    self.actual_preload_skip_count += 1
+                    self.actual_preload_skip_already_gpu_count += 1
                     continue
                 if self.placeholder_manager.is_loading(layer, expert_id):
-                    self.preload_skip_count += 1
-                    self.preload_skip_loading_count += 1
+                    self.actual_preload_skip_count += 1
+                    self.actual_preload_skip_loading_count += 1
                     continue
                 self.placeholder_manager.mark_loading(layer, expert_id)
                 try:
                     placeholder = self.placeholder_manager.acquire_free_placeholder(layer, expert_id)
                     if placeholder is None:
-                        self.preload_skip_count += 1
-                        self.preload_skip_no_slot_count += 1
+                        self.actual_preload_skip_count += 1
+                        self.actual_preload_skip_no_slot_count += 1
                         continue
                     self.placeholder_manager.load_weights(placeholder, self.get_cpu_expert(layer, expert_id))
                     self._record_preload_event(layer, expert_id)
                     loaded += 1
-                    self.preload_success_count += 1
+                    self.actual_preload_success_count += 1
                 finally:
                     self.placeholder_manager.unmark_loading(layer, expert_id)
             # elapsed = time.time() - tick
