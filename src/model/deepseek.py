@@ -79,29 +79,39 @@ class mDeepSeek:
         self.n_shared_experts = 2
 
         ### 加载基准数据，设置专家调度策略的 CPU/GPU 延迟参数
-        self.latency_cpu = 0.142
-        self.latency_copy = 0.4
-        self.latency_gpu = 0.093 #ms
-        self.latency_cpu_table = {1: 0.142}
-        self.latency_gpu_table = {1: 0.093}
-        benchmark_data = self._load_benchmark_data(args.model)
+        self.latency_model = ExpertLatencyModel(
+            t_io=0.35, #ms
+            latency_cpu_table={1: 1.5},
+            latency_gpu_table={1: 0.093},
+        )
+        # benchmark_data = self._load_benchmark_data(args.model)
+        benchmark_data = None
+        loaded_benchmark_latency = False
         if benchmark_data is not None:
             try:
-                self.latency_cpu = benchmark_data["expert_cpu"][0]["avg_time_ms"]
-                self.latency_copy = benchmark_data["expert_weight_copy"]["avg_ms"]
-                self.latency_gpu = benchmark_data["expert_gpu"][0]["avg_time_ms"]
-                self.latency_cpu_table = _build_latency_lookup(benchmark_data["expert_cpu"])
-                self.latency_gpu_table = _build_latency_lookup(benchmark_data["expert_gpu"])
-                print(f"Loaded benchmark latency_cpu={self.latency_cpu:.4f}ms, latency_copy={self.latency_copy:.4f}ms, latency_gpu={self.latency_gpu:.4f}ms")
-                print(f"Latency CPU table: {self.latency_cpu_table}")
-                print(f"Latency GPU table: {self.latency_gpu_table}")
+                self.latency_model = ExpertLatencyModel(
+                    t_io=benchmark_data["expert_weight_copy"]["avg_ms"],
+                    latency_cpu_table=_build_latency_lookup(benchmark_data["expert_cpu"]),
+                    latency_gpu_table=_build_latency_lookup(benchmark_data["expert_gpu"]),
+                )
+                loaded_benchmark_latency = True
             except (KeyError, TypeError) as e:
                 print(f"Warning: Malformed benchmark data, using defaults: {e}")
+        if loaded_benchmark_latency:
+            print(
+                "Loaded benchmark latency_model "
+                f"cpu_table={self.latency_model.latency_cpu_table}, "
+                f"gpu_table={self.latency_model.latency_gpu_table}, "
+                f"t_io={self.latency_model.t_io:.4f}ms"
+            )
         else:
-            print(f"Benchmark file not found, using default latency_cpu={self.latency_cpu}ms, latency_copy={self.latency_copy}ms")
+            print(
+                "Benchmark file not found, using default latency_model "
+                f"cpu_table={self.latency_model.latency_cpu_table}, "
+                f"gpu_table={self.latency_model.latency_gpu_table}, "
+                f"t_io={self.latency_model.t_io}ms"
+            )
 
-        self.cnt_expert_hit = 0
-        self.cnt_expert_all = 0
         self.hot_expert_counts = Counter()
 
         # 初始化策略
@@ -110,18 +120,13 @@ class mDeepSeek:
         elif args.cpu_offload == 1:
             self.expert_strategy = PrefetchHybridStrategy(
                 self.dev, self.is_expert_in_gpu,
-                t_io=self.latency_copy,
-                latency_cpu_table=self.latency_cpu_table,
-                latency_gpu_table=self.latency_gpu_table,
+                latency_model=self.latency_model,
             )
         else:
             self.expert_strategy = FiddlerStrategy(
                 self.dev, self.is_expert_in_gpu,
-                latency_cpu=self.latency_cpu,
-                latency_gpu=self.latency_gpu,
-                latency_io = self.latency_copy
+                latency_model=self.latency_model,
             )
-        self.gpu_only_strategy = GPUOnlyStrategy(self.dev, self.is_expert_in_gpu)
         print(f"Initialized expert scheduling strategy: {self.expert_strategy.__class__.__name__}")
 
         self._init_schedule_stats_recorder(args)
@@ -129,11 +134,6 @@ class mDeepSeek:
         # 初始化专家预测器和专家执行器
         self.expert_predictor = GatePredictor()
         self.predicted_next_demands = []
-        self.latency_model = ExpertLatencyModel(
-            t_io=self.latency_copy,
-            latency_cpu_table=self.latency_cpu_table,
-            latency_gpu_table=self.latency_gpu_table,
-        )
 
         # 加载模型权重到 GPU，先加载非专家模块，再加载hot专家模块
         load_model_tick = time.time()
@@ -194,11 +194,11 @@ class mDeepSeek:
             "n_shared_experts": self.n_shared_experts,
             "num_placeholders": self.placeholder_manager.num_placeholders,
             "eviction_strategy": type(self.placeholder_manager._eviction_strategy).__name__ if self.placeholder_manager._eviction_strategy else None,
-            "latency_cpu": self.latency_cpu,
-            "latency_gpu": self.latency_gpu,
-            "latency_copy": self.latency_copy,
-            "latency_cpu_table": {str(k): v for k, v in self.latency_cpu_table.items()},
-            "latency_gpu_table": {str(k): v for k, v in self.latency_gpu_table.items()},
+            "latency_model": {
+                "t_io": self.latency_model.t_io,
+                "latency_cpu_table": {str(k): v for k, v in self.latency_model.latency_cpu_table.items()},
+                "latency_gpu_table": {str(k): v for k, v in self.latency_model.latency_gpu_table.items()},
+            },
             "strategy": self.expert_strategy.__class__.__name__,
         }
         self.schedule_stats_recorder = ExpertSchedulingStatsRecorder(
@@ -294,7 +294,6 @@ class mDeepSeek:
         # 70% of total memory for safety margin
         #torch.cuda.memory_allocated：PyTorch 官方提供的显存统计 API，专门统计已使用的显存
         free_mem = total_mem * 0.70 - torch.cuda.memory_allocated(self.dev) 
-        # free_mem = total_mem * 0.20 - torch.cuda.memory_reserved(self.dev)
         
         print(f"Total GPU memory: {total_mem / 1024 / 1024:.2f} MB, Free GPU memory: {free_mem / 1024 / 1024:.2f} MB")
         return int(free_mem // (n_param * 2))
@@ -359,7 +358,6 @@ class mDeepSeek:
         probs = torch.full((input_ids.shape[0],), 1.0, device=self.dev)
 
         for i_token in range(output_token):
-            print(i_token)
             if profiler is not None and i_token == 0:
                 profiler.start()
                 print("[profiler] profiling started (prefill)")
@@ -448,6 +446,7 @@ class mDeepSeek:
 
         if self.sync_timing and self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
+
         decode_time = time.time() - tick
         probs = probs.view(-1, self.beam_width)
         max_ids = torch.argmax(probs, dim=-1)
@@ -460,7 +459,7 @@ class mDeepSeek:
             decoded_outputs = self.tokenizer.batch_decode(selected_tokens.detach().cpu(), skip_special_tokens=False)
 
         print("--------------------")
-        print(f"Input: {text}")
+        print(f"Input: {text[:128]}")
         print(f"Output: {decoded_outputs[0]}")
 
         if hasattr(self, "expert_executor"):
@@ -469,20 +468,12 @@ class mDeepSeek:
         return (
             prefill_time,
             decode_time,
-            self.cnt_expert_hit / max(self.cnt_expert_all, 1),
         )
 
     def reset_runtime_state(self, clear_placeholders=False):
         self.past_key_value = transformers.cache_utils.DynamicCache()
         self.past_key_values_length = 0
         self.predicted_next_demands = []
-        self.cnt_expert_hit = 0
-        self.cnt_expert_all = 0
-
-        if hasattr(self.expert_strategy, "cnt_expert_hit"):
-            self.expert_strategy.cnt_expert_hit = 0
-        if hasattr(self.expert_strategy, "cnt_expert_all"):
-            self.expert_strategy.cnt_expert_all = 0
 
         if hasattr(self, "expert_executor"):
             self.expert_executor.preload_request_count = 0
@@ -648,10 +639,7 @@ class mDeepSeek:
                 prefetch_experts = []
             # print(f"Layer {i_layer}: GPU experts: {gpu_experts}, CPU experts: {cpu_experts}, Prefetch: {prefetch_experts}")
 
-            # 更新统计
-            if isinstance(strategy, FiddlerStrategy) or isinstance(strategy, PrefetchHybridStrategy):
-                self.cnt_expert_hit = self.expert_strategy.cnt_expert_hit
-                self.cnt_expert_all = self.expert_strategy.cnt_expert_all
+
             
 
             schedule = ExpertSchedule(
@@ -678,4 +666,3 @@ class mDeepSeek:
 
         self.present_key_value = present_key_value
         return lm_logis
-

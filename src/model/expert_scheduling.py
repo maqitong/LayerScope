@@ -350,11 +350,9 @@ class FiddlerStrategy(ExpertSchedulingStrategy):
     - 按每个活跃专家独立选择代价更低的 CPU/GPU 执行位置
     - 统计 GPU 缓存命中率
     """
-    def __init__(self, dev, is_expert_in_gpu, latency_cpu, latency_gpu, latency_io):
+    def __init__(self, dev, is_expert_in_gpu, latency_model: ExpertLatencyModel):
         super().__init__(dev, is_expert_in_gpu)
-        self.latency_cpu = latency_cpu  # CPU 上每个 token 的延迟
-        self.latency_gpu = latency_gpu  # GPU 上执行专家的固定延迟
-        self.latency_io = latency_io  # 将专家权重从 CPU 拷贝到 GPU 的固定延迟
+        self.latency_model = latency_model
         self.cnt_expert_hit = 0  # GPU 缓存命中的 token 数
         self.cnt_expert_all = 0  # 总 token 数
 
@@ -377,8 +375,8 @@ class FiddlerStrategy(ExpertSchedulingStrategy):
         per_expert_details = []
         for i_expert in active_experts:
             token_count = token_indices_by_expert[i_expert].shape[0]
-            cost_cpu = token_count * self.latency_cpu
-            cost_gpu = self.latency_gpu + self.latency_io
+            cost_cpu = self.latency_model.cpu(token_count)
+            cost_gpu = self.latency_model.gpu_compute(token_count) + self.latency_model.transfer(i_layer, i_expert)
             resident = self.is_expert_in_gpu(i_layer, i_expert)
             if resident:
                 cost_gpu = 0
@@ -415,11 +413,7 @@ class FiddlerStrategy(ExpertSchedulingStrategy):
                 "preload_experts": [],
                 "token_counts": _token_counts_by_expert(token_indices_by_expert),
                 "placement": _placement_summary(kwargs.get("placement")),
-                "strategy_params": {
-                    "latency_cpu": self.latency_cpu,
-                    "latency_gpu": self.latency_gpu,
-                    "latency_io": self.latency_io,
-                },
+                "latency": _latency_summary(self.latency_model),
                 "per_expert_details": per_expert_details,
                 "counters": {
                     "expert_hit": self.cnt_expert_hit,
@@ -774,21 +768,12 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
     - 把 ExpertSchedule 转回 deepseek.py 使用的返回格式
 
     参数：
-    - t_io: 专家权重传输延迟（秒）
-    - latency_cpu_table: CPU 延迟查找表 {token_count: time_ms}
-    - latency_gpu_table: GPU 延迟查找表 {token_count: time_ms}
+    - latency_model: 专家 CPU/GPU/传输延迟模型
     """
 
-    def __init__(self, dev, is_expert_in_gpu, t_io: float,
-                 latency_cpu_table: Dict[int, float],
-                 latency_gpu_table: Dict[int, float]):
+    def __init__(self, dev, is_expert_in_gpu, latency_model: ExpertLatencyModel):
         super().__init__(dev, is_expert_in_gpu)
-        self.t_io = t_io
-        self.latency_cpu_table = latency_cpu_table
-        self.latency_gpu_table = latency_gpu_table
-        self.cnt_expert_hit = 0
-        self.cnt_expert_all = 0
-        self.latency_model = ExpertLatencyModel(t_io, latency_cpu_table, latency_gpu_table)
+        self.latency_model = latency_model
         self.scheduler = PDScopeScheduler()
 
     def decide_and_prepare(
@@ -813,18 +798,13 @@ class PrefetchHybridStrategy(ExpertSchedulingStrategy):
         if future is None:
             future = build_future_demands(i_layer + 1, predicted_next_experts, predicted_next_weights)
         future = unique_demands(future)
+
         if placement is None:
             gpu_resident = set()
             for demand in current_demands + future:
                 if self.is_expert_in_gpu(demand.key.layer, demand.key.expert_id):
                     gpu_resident.add((demand.key.layer, demand.key.expert_id))
             placement = PlacementSnapshot(gpu_resident=gpu_resident)
-
-        for demand in current_demands:
-            on_gpu = placement.is_on_gpu(demand.key.layer, demand.key.expert_id)
-            if on_gpu:
-                self.cnt_expert_hit += demand.token_count
-            self.cnt_expert_all += demand.token_count
 
         request = ExpertLayerRequest(
             layer=i_layer,
