@@ -226,6 +226,7 @@ class ExpertPlaceholderManager:
             self._reverse_map.pop(expert_key, None)
             if expert_key not in self._static_gpu_resident:
                 self._cpu_resident.add(expert_key)
+        self._protected.discard(pid)
         self._available.add(pid)
         if self._eviction_strategy is not None:
             self._eviction_strategy.on_release(pid)
